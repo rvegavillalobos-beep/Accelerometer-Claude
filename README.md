@@ -13,7 +13,10 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   optional non-uniform friction per corner region).
 - Turntable detection from the gyroscope: angle, fast / slow phases, spin-up and braking, friction demand at
   entry, rotation and exit, and an estimate of the turntable axis position relative to the sensor.
-- Animated top view (carrier or plant frame), friction demand vs. capacity, slip-event table with pivot location.
+- Travel direction of the carrier per motion segment (auto-detected, manually editable) and a motion phase for
+  every critical moment (accelerating, braking / stop, lateral load, stopped, rotating on turntable).
+- Animated top view (carrier or plant frame) with travel-direction arrow, friction demand vs. capacity,
+  slip-event table with pivot location.
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings.
 - CSV / JSON export of all results.
 
@@ -37,6 +40,7 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `data_io.py` | WitMotion parser and signal pre-processing |
 | `slip_model.py` | Friction contact model, stick-slip simulation, event extraction |
 | `turns.py` | Turntable / rotation detection and analysis |
+| `motion.py` | Travel direction and motion phase of the carrier |
 | `visuals.py` | Plotly figures and the animated top view |
 
 ## Coordinate convention

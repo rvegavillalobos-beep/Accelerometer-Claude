@@ -13,6 +13,7 @@ Run locally:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 
@@ -40,6 +41,15 @@ from slip_model import (
     results_table,
     simulate,
     summary,
+)
+from motion import (
+    DIRECTIONS,
+    TravelSettings,
+    detect_motion,
+    motion_phase,
+    segment_key,
+    segments_table,
+    travel_arrays,
 )
 from turns import (
     TurnSettings,
@@ -413,6 +423,28 @@ with st.sidebar:
             help="Same-direction rotations separated by less than this are one turn (fast phase + slow positioning).",
         )
 
+    with st.expander("8 · Travel direction"):
+        tv_vib = st.number_input(
+            "Rolling-vibration threshold [g]",
+            value=0.008,
+            min_value=0.001,
+            max_value=0.2,
+            step=0.001,
+            format="%.3f",
+            help="Vertical vibration (1-s RMS) above which the carrier is considered to be rolling on the conveyor.",
+        )
+        tv_win = st.number_input(
+            "Start / stop window [s]",
+            value=2.5,
+            min_value=0.5,
+            max_value=10.0,
+            step=0.5,
+            help="The velocity is integrated only over this window after each start and before each stop.",
+        )
+        tv_snap = st.toggle(
+            "Snap to carrier axes", value=True, help="Conveyors move the carrier along one of its own axes (±X or ±Y)."
+        )
+
     with st.expander("Advanced solver settings"):
         dt_sub_ms = st.select_slider("Integration step while sliding [ms]", [0.25, 0.5, 1.0, 2.0], value=1.0)
         n_dirs = st.select_slider("Limit-surface resolution", [1000, 2500, 5000], value=2500)
@@ -486,14 +518,35 @@ turn_tab = analyse_rotations(kin, res, rotations, turn_s)
 n_turns = sum(r.kind == "Turntable" for r in rotations)
 axis_est = estimate_axis_all(kin, rotations)
 
+# travel direction (auto-detected per motion segment, manual overrides kept in the session)
+travel_s = TravelSettings(vib_threshold_g=float(tv_vib), window_s=float(tv_win), snap=bool(tv_snap))
+motion_segs = detect_motion(kin, res, rotations, travel_s)
+travel_ov_key = f"travel_ov_{active}"
+travel_overrides = st.session_state.get(travel_ov_key, {})
+travel = travel_arrays(kin, motion_segs, rotations, travel_overrides)
+
+
+def _phase_at(t_: float) -> str:
+    i_ = int(np.clip(np.searchsorted(kin.t, t_), 0, len(kin.t) - 1))
+    return motion_phase(i_, travel, res.fhx_com, res.fhy_com)
+
+
 # conveyor context for critical moments and slip events
 if len(crit):
     crit["Carrier motion"] = [locate(t_, rotations, turn_s.pad_s) for t_ in crit["Time [s]"]]
     crit = crit.rename(columns={"Carrier motion": "Conveyor context"})
+    crit.insert(
+        crit.columns.get_loc("Conveyor context") + 1, "Motion phase", [_phase_at(t_) for t_ in crit["Time [s]"]]
+    )
 events_view = res.events.copy()
 if len(events_view):
     events_view["Carrier motion"] = [locate(t_, rotations, turn_s.pad_s) for t_ in events_view["Start [s]"]]
     events_view = events_view.rename(columns={"Carrier motion": "Conveyor context"})
+    events_view.insert(
+        events_view.columns.get_loc("Conveyor context") + 1,
+        "Motion phase",
+        [_phase_at(t_) for t_ in events_view["Start [s]"]],
+    )
 
 # animation window (shared with the Turntables tab)
 t_lo, t_hi = round(float(kin.t[0]), 1), round(float(kin.t[-1]), 1)
@@ -730,15 +783,59 @@ with tab_anim:
                 plant_view=view.startswith("Plant"),
                 max_frames=int(nfr),
                 playback_speed=float(speed),
+                travel=travel,
             ),
             config=PLOT_CONFIG,
             key="anim",
         )
         st.caption(
-            "Blue = cluster sticking, red = sliding. Orange arrow = direction in which inertia pushes the cluster "
-            "relative to the GOT (length ∝ load; 0.25 g reaches half the cluster width). × = instantaneous pivot "
-            "while sliding. The GOT outline is schematic."
+            "Blue = cluster sticking, red = sliding. Violet arrow outside the GOT = direction in which the carrier "
+            "travels (grey when the direction is uncertain). Orange arrow = direction in which inertia pushes the "
+            "cluster relative to the GOT (length ∝ load; 0.25 g reaches half the cluster width): it points backwards "
+            "while the carrier speeds up and forwards while it brakes. × = instantaneous pivot while sliding. "
+            "The GOT outline is schematic."
         )
+        with st.expander("Travel direction per motion segment (auto-detected, editable)"):
+            st.caption(
+                "Each row is a period in which the carrier rolls on the conveyor. The direction comes from the velocity "
+                "after the start and before the stop; 'High' means both agree. If you know the real direction (e.g. from "
+                "the video), set it in the Direction column; it is used in the animation and in the Motion phase columns."
+            )
+            seg_keys = [segment_key(g) for g in motion_segs]
+            ed_key = f"travel_ed_{active}_" + hashlib.md5("|".join(seg_keys).encode()).hexdigest()[:10]
+
+            def _save_travel_overrides(ed_key=ed_key, ov_key=travel_ov_key, seg_keys=seg_keys):
+                edits = (st.session_state.get(ed_key) or {}).get("edited_rows", {})
+                ov = dict(st.session_state.get(ov_key, {}))
+                for row, change in edits.items():
+                    if "Direction" in change and int(row) < len(seg_keys):
+                        ov[seg_keys[int(row)]] = change["Direction"]
+                st.session_state[ov_key] = ov
+
+            def _reset_travel_overrides(ed_key=ed_key, ov_key=travel_ov_key):
+                st.session_state[ov_key] = {}
+                if ed_key in st.session_state:
+                    del st.session_state[ed_key]
+
+            seg_df = segments_table(motion_segs, travel_overrides)
+            if seg_df.empty:
+                st.info(
+                    "No motion segment detected. Lower the rolling-vibration threshold in the sidebar (8 · Travel direction)."
+                )
+            else:
+                st.data_editor(
+                    seg_df,
+                    key=ed_key,
+                    on_change=_save_travel_overrides,
+                    hide_index=True,
+                    disabled=[c for c in seg_df.columns if c != "Direction"],
+                    column_config={
+                        "Direction": st.column_config.SelectboxColumn(
+                            "Direction", options=["Auto", *DIRECTIONS.keys(), "Stopped"], required=True
+                        )
+                    },
+                )
+                st.button("Reset manual directions", on_click=_reset_travel_overrides)
         st.plotly_chart(fig_motion(res, tol_mm, a_win[0], a_win[1]), config=PLOT_CONFIG, key="anim_motion")
         st.markdown("##### Corner paths in the animation window")
         st.caption(
@@ -947,6 +1044,8 @@ with tab_exp:
         "solver": solver_d,
         "allowed_corner_displacement_mm": tol_mm,
         "turntable_detection": asdict(turn_s),
+        "travel_direction": asdict(travel_s),
+        "travel_direction_overrides": travel_overrides,
         "summary": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in sm.items()},
     }
     c1, c2 = st.columns(2)
@@ -973,6 +1072,13 @@ with tab_exp:
             f"{stem}_turntables.csv",
             "text/csv",
             disabled=turn_tab.empty,
+        )
+        st.download_button(
+            "Motion segments / travel direction (CSV)",
+            segments_table(motion_segs, travel_overrides).to_csv(index=False).encode(),
+            f"{stem}_motion_segments.csv",
+            "text/csv",
+            disabled=not motion_segs,
         )
     with c2:
         st.download_button(
@@ -1046,6 +1152,16 @@ each phase.
 **Axis position.** For a carrier rotating about a fixed axis O the sensor S measures
 **a**ₛ = α ẑ × **r** − ω² **r** with **r** = S − O. A least-squares fit over the rotation samples gives **r**.
 The fit relies mainly on the spin-up and braking (α) and is therefore limited by the sample rate.
+
+#### Travel direction
+
+The inertial load alone does not show where the carrier is going: it points against the acceleration, so it
+vanishes at constant speed. The carrier is considered to be rolling when the vertical vibration exceeds a
+threshold. For each rolling period the velocity is integrated only over a short window after the start
+(from rest) and before the stop (back to rest), which avoids the drift caused by conveyor slopes and sensor
+offsets. When both windows give the same direction the confidence is *High*. The direction is snapped to the
+carrier axes (±X, ±Y) and can be overridden manually. The **Motion phase** column then tells whether a load
+occurred while the carrier was accelerating, braking / stopping, or as a lateral load.
 
 #### Assumptions and limits
 

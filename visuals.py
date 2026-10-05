@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from data_io import Kinematics
+from motion import STATE_MOVING, STATE_ROTATING, STATE_UNKNOWN
 from slip_model import CORNER_NAMES, SimulationResult
 
 # Categorical palette (fixed order) and reserved status / ink colours
@@ -309,8 +310,9 @@ def fig_topview(
     plant_view: bool = False,
     max_frames: int = 600,
     playback_speed: float = 1.0,
+    travel: dict | None = None,
 ) -> go.Figure:
-    """Animated top view of the GOT and the cell cluster."""
+    """Animated top view of the GOT and the cell cluster (optionally with the travel direction)."""
     cl = res.cluster
     L, W = cl.length, cl.width
     margin_got = 0.08 * max(L, W)
@@ -336,7 +338,8 @@ def fig_topview(
     )
 
     k = exaggeration
-    R = 0.5 * np.hypot(Lg, Wg) + 0.15 * max(L, W)
+    R = 0.5 * np.hypot(Lg, Wg) + (0.42 if travel is not None else 0.15) * max(L, W)
+    t_off, t_len = 0.05 * max(L, W), 0.25 * max(L, W)  # travel arrow: gap to the GOT edge and length
     heading0 = kin.heading[frames_idx[0]]
     arrow_scale = (W / 2) / 0.25  # 0.25 g -> half the width
 
@@ -380,6 +383,34 @@ def fig_topview(
         ty = com0[1] + k * res.uy[tr]
         if plant_view:
             tx, ty = _rot_pts(tx, ty, ang)
+        # travel direction arrow, drawn outside the GOT on the side the carrier is moving to
+        trav_xy, trav_unc_xy = ([None], [None]), ([None], [None])
+        motion_line = ""
+        if travel is not None:
+            stt = int(travel["state"][i])
+            if stt == STATE_MOVING:
+                dx, dy = float(travel["ux"][i]), float(travel["uy"][i])
+                t_edge = min(
+                    (Lg / 2) / abs(dx) if abs(dx) > 1e-9 else np.inf,
+                    (Wg / 2) / abs(dy) if abs(dy) > 1e-9 else np.inf,
+                )
+                p0, p1 = t_edge + t_off, t_edge + t_off + t_len
+                xy = _rot_pts([p0 * dx, p1 * dx], [p0 * dy, p1 * dy], ang)
+                low = travel["confidence"][i] == "Low"
+                if low:
+                    trav_unc_xy = xy
+                else:
+                    trav_xy = xy
+                spd = travel["speed"][i]
+                lab = str(travel["label"][i])
+                motion_line = f"<br>Carrier moving {lab}" + (f" ~{spd:.2f} m/s" if np.isfinite(spd) else "")
+                motion_line += " (direction uncertain)" if low else ""
+            elif stt == STATE_ROTATING:
+                motion_line = "<br>Carrier rotating on turntable"
+            elif stt == STATE_UNKNOWN:
+                motion_line = "<br>Carrier moving (direction uncertain)"
+            else:
+                motion_line = "<br>Carrier stopped"
         clock = pd.Timestamp(res.clock[i]).strftime("%H:%M:%S.%f")[:-4]
         mu = res.mu_req[i]
         mu_txt = f"{mu:.3f}" if np.isfinite(mu) else "∞ (lift-off)"
@@ -388,6 +419,7 @@ def fig_topview(
             f"{clock}   t = {res.t[i]:.2f} s<br>"
             f"Required μ {mu_txt}  (μs {res.contact.mu_s:.3f})   {state}<br>"
             f"Max corner shift {res.corner_disp[i].max() * 1e3:.2f} mm   Rotation {np.rad2deg(res.phi[i]):.3f}°"
+            f"{motion_line}"
         )
         return [
             go.Scatter(x=gx, y=gy),
@@ -399,6 +431,8 @@ def fig_topview(
             go.Scatter(x=ixr, y=iyr),
             go.Scatter(x=tx, y=ty),
             go.Scatter(x=com_r[0], y=com_r[1]),
+            go.Scatter(x=trav_xy[0], y=trav_xy[1]),
+            go.Scatter(x=trav_unc_xy[0], y=trav_unc_xy[1]),
             go.Scatter(x=[-R + 0.03 * R], y=[R - 0.03 * R], text=[status]),
         ]
 
@@ -458,6 +492,22 @@ def fig_topview(
             name="Cluster CoM",
             showlegend=False,
             hoverinfo="skip",
+        ),
+        dict(
+            mode="lines+markers",
+            line=dict(color=SERIES[6], width=4),
+            marker=dict(symbol="arrow", angleref="previous", size=[0, 16], color=SERIES[6]),
+            name="Travel direction",
+            hoverinfo="skip",
+            showlegend=travel is not None,
+        ),
+        dict(
+            mode="lines+markers",
+            line=dict(color=MUTED, width=3),
+            marker=dict(symbol="arrow", angleref="previous", size=[0, 14], color=MUTED),
+            name="Travel direction (uncertain)",
+            hoverinfo="skip",
+            showlegend=travel is not None,
         ),
         dict(mode="text", textposition="bottom right", textfont=dict(size=12), showlegend=False, hoverinfo="skip"),
     ]
