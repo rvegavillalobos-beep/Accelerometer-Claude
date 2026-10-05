@@ -41,6 +41,14 @@ from slip_model import (
     simulate,
     summary,
 )
+from turns import (
+    TurnSettings,
+    analyse_rotations,
+    detect_rotations,
+    estimate_axis_all,
+    locate,
+    turn_insight,
+)
 from visuals import (
     PLOT_CONFIG,
     auto_exaggeration,
@@ -50,7 +58,9 @@ from visuals import (
     fig_kinematics,
     fig_motion,
     fig_sweep,
+    fig_rotation_timeline,
     fig_topview,
+    fig_turn_profiles,
 )
 
 APP_VERSION = "1.0.0"
@@ -224,24 +234,27 @@ with st.sidebar:
     }[axis_label]
     auto_flip = st.toggle("Auto-detect upside-down mounting", value=True)
     c1, c2 = st.columns(2)
+    for _k in ("sensor_x", "sensor_y"):
+        if _k not in st.session_state:
+            st.session_state[_k] = 0.0
     sx = c1.number_input(
         "Sensor X [m]",
-        value=0.0,
+        key="sensor_x",
         step=0.05,
         format="%.3f",
         help="Sensor position on the carrier relative to the nominal cluster centre, along carrier X.",
     )
     sy = c2.number_input(
         "Sensor Y [m]",
-        value=0.0,
+        key="sensor_y",
         step=0.05,
         format="%.3f",
         help="Sensor position on the carrier relative to the nominal cluster centre, along carrier Y.",
     )
     st.caption(
         "The sensor offset is used to transfer the measured motion to the cluster centre during turntable "
-        "rotations (centripetal and tangential terms). The turntable pivot itself does not need to be entered: "
-        "the sensor already measures the carrier motion."
+        "rotations (centripetal and tangential terms). The Turntables tab estimates the sensor position relative "
+        "to the turntable axis from the data and can fill these fields."
     )
     bias_on = st.toggle(
         "Remove static offset (rest window)",
@@ -365,6 +378,41 @@ with st.sidebar:
             help="Displacement of any cluster corner relative to its start position.",
         )
 
+    with st.expander("7 · Turntable detection"):
+        tt_rate = st.number_input(
+            "Rotation threshold [deg/s]",
+            value=0.5,
+            min_value=0.05,
+            max_value=20.0,
+            step=0.1,
+            help="Yaw rate above which the carrier is considered to be rotating.",
+        )
+        tt_min = st.number_input(
+            "Minimum turntable angle [deg]",
+            value=45.0,
+            min_value=5.0,
+            max_value=360.0,
+            step=5.0,
+            help="Rotations at least this large are reported as turntable turns; smaller ones as minor rotations.",
+        )
+        tt_nom = st.number_input("Nominal turntable angle [deg]", value=90.0, min_value=1.0, max_value=360.0, step=5.0)
+        tt_pad = st.number_input(
+            "Entry / exit window [s]",
+            value=4.0,
+            min_value=0.5,
+            max_value=30.0,
+            step=0.5,
+            help="Time analysed before and after each turn (carrier stopping on and leaving the table).",
+        )
+        tt_merge = st.number_input(
+            "Merge gap [s]",
+            value=1.0,
+            min_value=0.0,
+            max_value=10.0,
+            step=0.5,
+            help="Same-direction rotations separated by less than this are one turn (fast phase + slow positioning).",
+        )
+
     with st.expander("Advanced solver settings"):
         dt_sub_ms = st.select_slider("Integration step while sliding [ms]", [0.25, 0.5, 1.0, 2.0], value=1.0)
         n_dirs = st.select_slider("Limit-surface resolution", [1000, 2500, 5000], value=2500)
@@ -426,6 +474,41 @@ except Exception as exc:  # noqa: BLE001
 sm = summary(res, kin)
 crit = critical_moments(res, kin, n=10)
 
+turn_s = TurnSettings(
+    rate_threshold_deg_s=float(tt_rate),
+    min_turn_deg=float(tt_min),
+    merge_gap_s=float(tt_merge),
+    pad_s=float(tt_pad),
+    nominal_deg=float(tt_nom),
+)
+rotations = detect_rotations(kin, turn_s)
+turn_tab = analyse_rotations(kin, res, rotations, turn_s)
+n_turns = sum(r.kind == "Turntable" for r in rotations)
+axis_est = estimate_axis_all(kin, rotations)
+
+# conveyor context for critical moments and slip events
+if len(crit):
+    crit["Carrier motion"] = [locate(t_, rotations, turn_s.pad_s) for t_ in crit["Time [s]"]]
+    crit = crit.rename(columns={"Carrier motion": "Conveyor context"})
+events_view = res.events.copy()
+if len(events_view):
+    events_view["Carrier motion"] = [locate(t_, rotations, turn_s.pad_s) for t_ in events_view["Start [s]"]]
+    events_view = events_view.rename(columns={"Carrier motion": "Conveyor context"})
+
+# animation window (shared with the Turntables tab)
+t_lo, t_hi = round(float(kin.t[0]), 1), round(float(kin.t[-1]), 1)
+anim_key = f"anim_{active}_{t_lo:.1f}_{t_hi:.1f}"
+
+
+def _show_in_animation(a: float, b: float):
+    st.session_state[anim_key] = (float(np.clip(round(a, 1), t_lo, t_hi)), float(np.clip(round(b, 1), t_lo, t_hi)))
+
+
+def _use_axis_as_sensor(x: float, y: float):
+    st.session_state["sensor_x"] = round(float(x), 3)
+    st.session_state["sensor_y"] = round(float(y), 3)
+
+
 # --------------------------------------------------------------------------- #
 # Header: verdict and KPIs
 # --------------------------------------------------------------------------- #
@@ -484,12 +567,18 @@ k6.metric(
     f"{sm['min_fz_g']:.3f} g",
     help="Below 1 g the cluster is momentarily lighter and the friction capacity drops.",
 )
-k7.metric("Peak yaw rate", f"{sm['peak_yaw_rate_deg_s']:.1f} °/s")
+k7.metric(
+    "Turntable rotations",
+    f"{n_turns}",
+    help="Carrier rotations of at least the minimum turntable angle (see the Turntables tab). "
+    f"Peak yaw rate {sm['peak_yaw_rate_deg_s']:.1f} °/s.",
+)
 k8.metric("Peak yaw accel.", f"{sm['peak_yaw_acc_deg_s2']:.1f} °/s²")
 
 tabs = st.tabs(
     [
         "Overview",
+        "Turntables",
         "Top-view animation",
         "Signals",
         "Slip events",
@@ -499,11 +588,12 @@ tabs = st.tabs(
         "Method",
     ]
 )
+tab_over, tab_turn, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab_exp, tab_meth = tabs
 
 # --------------------------------------------------------------------------- #
 # Overview
 # --------------------------------------------------------------------------- #
-with tabs[0]:
+with tab_over:
     st.plotly_chart(fig_friction(res), config=PLOT_CONFIG, key="ov_friction")
     st.markdown("##### Most critical moments")
     st.caption(
@@ -513,10 +603,83 @@ with tabs[0]:
     st.dataframe(crit, hide_index=True)
 
 # --------------------------------------------------------------------------- #
+# Turntables
+# --------------------------------------------------------------------------- #
+with tab_turn:
+    st.caption(
+        "Carrier rotations are detected from the gyroscope yaw rate and their angle is its integral. "
+        "Entry and exit windows cover the carrier stopping on the table and leaving it."
+    )
+    if not rotations:
+        st.info("No carrier rotation detected with the current settings (sidebar · 7 · Turntable detection).")
+    else:
+        for msg in turn_insight(turn_tab, mu_s):
+            st.markdown(f"- {msg}")
+        tt_only = turn_tab[turn_tab["Type"] == "Turntable"]
+        mu_cols = ["Required mu · entry", "Required mu · rotation", "Required mu · exit"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Turntable rotations", f"{n_turns}")
+        c2.metric("Mean |angle|", f"{tt_only['Angle [deg]'].abs().mean():.1f}°" if len(tt_only) else "-")
+        c3.metric(
+            "Max deviation from nominal",
+            f"{tt_only['Deviation from nominal [deg]'].abs().max():.1f}°" if len(tt_only) else "-",
+            help=f"Nominal angle {tt_nom:g}°.",
+        )
+        mu_near = float(np.nanmax(tt_only[mu_cols].to_numpy(dtype=float))) if len(tt_only) else float("nan")
+        c4.metric(
+            "Highest μ around turntables",
+            f"{mu_near:.3f}" if np.isfinite(mu_near) else "-",
+            f"{(mu_s / mu_near - 1) * 100:+.0f}% margin vs μs" if np.isfinite(mu_near) and mu_near > 0 else None,
+        )
+        st.plotly_chart(fig_rotation_timeline(kin, res, rotations, turn_s.pad_s), config=PLOT_CONFIG, key="tt_timeline")
+        st.markdown("##### Detected rotations")
+        st.dataframe(turn_tab, hide_index=True)
+
+        st.markdown("##### Turntable axis position")
+        rx, ry, se, r2 = axis_est["rx"], axis_est["ry"], axis_est["se"], axis_est["r2"]
+        if np.isfinite(rx) and np.isfinite(r2) and r2 >= 0.3 and np.isfinite(se) and se < 0.15:
+            st.markdown(
+                f"Fitted over all turns, the sensor sits at **X = {rx:+.2f} m, Y = {ry:+.2f} m** from the turntable "
+                f"axis ({np.hypot(rx, ry):.2f} m, ± {se:.2f} m, R² = {r2:.2f}). The per-turn values are in the table "
+                "above; similar values across turns indicate a reliable estimate."
+            )
+            st.caption(
+                "If the turntable rotates the carrier about the cluster centre, this is the sensor position to use in "
+                "the sidebar. Otherwise enter the measured position."
+            )
+            st.button("Use as sensor position", on_click=_use_axis_as_sensor, args=(rx, ry))
+        else:
+            st.info(
+                "The axis position could not be estimated reliably from this record "
+                "(weak angular acceleration or noisy acceleration data)."
+            )
+
+        st.markdown("##### Turn profiles")
+        st.caption(
+            "All turntable rotations aligned at their start. Different ramp shapes or a slow final phase reveal "
+            "differences between tables or drives."
+        )
+        st.plotly_chart(fig_turn_profiles(kin, rotations), config=PLOT_CONFIG, key="tt_profiles")
+
+        st.markdown("##### Turn detail")
+        rot_labels = [f"{r.label} · {r.angle_deg:+.1f}° · {fmt_clock(kin.clock[r.i0])}" for r in rotations]
+        sel_t = st.selectbox("Rotation", rot_labels, key="tt_sel")
+        r_sel = rotations[rot_labels.index(sel_t)]
+        w0 = max(float(kin.t[0]), r_sel.t0 - turn_s.pad_s - 1.0)
+        w1 = min(float(kin.t[-1]), r_sel.t1 + turn_s.pad_s + 1.0)
+        st.button(
+            "Show this turn in the Top-view animation",
+            on_click=_show_in_animation,
+            args=(w0, w1),
+            help="Sets the animation window to this turn; then open the Top-view animation tab.",
+        )
+        st.plotly_chart(fig_friction(res, w0, w1), config=PLOT_CONFIG, key="tt_friction")
+        st.plotly_chart(fig_kinematics(kin, res, w0, w1), config=PLOT_CONFIG, key="tt_kin")
+
+# --------------------------------------------------------------------------- #
 # Animation
 # --------------------------------------------------------------------------- #
-with tabs[1]:
-    t_lo, t_hi = round(float(kin.t[0]), 1), round(float(kin.t[-1]), 1)
+with tab_anim:
     if len(res.events):
         ev = res.events.iloc[int(np.argmax(res.events["Max corner shift [mm]"].to_numpy()))]
         centre = 0.5 * (ev["Start [s]"] + ev["End [s]"])
@@ -526,13 +689,17 @@ with tabs[1]:
         centre = t_lo
     d0 = (max(t_lo, centre - 15.0), min(t_hi, centre + 15.0))
     c1, c2, c3, c4 = st.columns([3, 1.3, 1.2, 1.2])
+    if anim_key not in st.session_state:
+        st.session_state[anim_key] = (
+            float(np.clip(round(d0[0], 1), t_lo, t_hi)),
+            float(np.clip(round(d0[1], 1), t_lo, t_hi)),
+        )
     a_win = c1.slider(
         "Animation window [s]",
         min_value=t_lo,
         max_value=t_hi,
-        value=(float(np.clip(round(d0[0], 1), t_lo, t_hi)), float(np.clip(round(d0[1], 1), t_lo, t_hi))),
         step=0.1,
-        key=f"anim_{active}_{t_lo:.1f}_{t_hi:.1f}",
+        key=anim_key,
         help="Defaults to ±15 s around the largest slip event, or around the most critical moment.",
     )
     view = c2.radio("View", ["Carrier (GOT fixed)", "Plant (carrier rotates)"], key="view")
@@ -582,7 +749,7 @@ with tabs[1]:
 # --------------------------------------------------------------------------- #
 # Signals
 # --------------------------------------------------------------------------- #
-with tabs[2]:
+with tab_sig:
     st.plotly_chart(fig_kinematics(kin, res), config=PLOT_CONFIG, key="sig_kin")
     c1, c2 = st.columns(2)
     with c1:
@@ -628,14 +795,14 @@ with tabs[2]:
 # --------------------------------------------------------------------------- #
 # Slip events
 # --------------------------------------------------------------------------- #
-with tabs[3]:
+with tab_ev:
     if res.events.empty:
         st.info(
             "No slip predicted with the current parameters. The 'Most critical moments' table in the Overview tab "
             "lists where the margin is smallest; the Friction sensitivity tab shows at which μ slip would start."
         )
     else:
-        st.dataframe(res.events, hide_index=True)
+        st.dataframe(events_view, hide_index=True)
         labels = [
             f"#{n} · {c} · {d:.3f} s · {pv}"
             for n, c, d, pv in zip(
@@ -686,7 +853,7 @@ with tabs[3]:
 # --------------------------------------------------------------------------- #
 # Friction sensitivity
 # --------------------------------------------------------------------------- #
-with tabs[4]:
+with tab_sens:
     st.caption(
         "Repeats the simulation for a range of static friction coefficients (same record and settings). "
         "Use it to judge how sensitive the result is to surface condition, contamination or material changes."
@@ -720,7 +887,7 @@ with tabs[4]:
 # --------------------------------------------------------------------------- #
 # Compare recordings
 # --------------------------------------------------------------------------- #
-with tabs[5]:
+with tab_cmp:
     if len(valid) < 2:
         st.info("Upload two or more recordings to compare them (e.g. before / after a conveyor adjustment).")
     else:
@@ -738,6 +905,7 @@ with tabs[5]:
                     st.warning(f"{name}: {exc}")
                     continue
                 s_i = summary(res_i, kin_i)
+                n_turn_i = sum(r.kind == "Turntable" for r in detect_rotations(kin_i, turn_s))
                 rows.append(
                     {
                         "Recording": name,
@@ -753,6 +921,7 @@ with tabs[5]:
                         "Peak horiz. accel. [g]": round(s_i["peak_fh_g"], 3),
                         "Min. vertical [g]": round(s_i["min_fz_g"], 3),
                         "Peak yaw accel. [deg/s2]": round(s_i["peak_yaw_acc_deg_s2"], 1),
+                        "Turntable rotations": n_turn_i,
                     }
                 )
         if rows:
@@ -766,7 +935,7 @@ with tabs[5]:
 # --------------------------------------------------------------------------- #
 # Export
 # --------------------------------------------------------------------------- #
-with tabs[6]:
+with tab_exp:
     stem = active.rsplit(".", 1)[0]
     params = {
         "app_version": APP_VERSION,
@@ -777,6 +946,7 @@ with tabs[6]:
         "sensor": sensor_d,
         "solver": solver_d,
         "allowed_corner_displacement_mm": tol_mm,
+        "turntable_detection": asdict(turn_s),
         "summary": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in sm.items()},
     }
     c1, c2 = st.columns(2)
@@ -789,13 +959,20 @@ with tabs[6]:
         )
         st.download_button(
             "Slip events (CSV)",
-            res.events.to_csv(index=False).encode(),
+            events_view.to_csv(index=False).encode(),
             f"{stem}_slip_events.csv",
             "text/csv",
             disabled=res.events.empty,
         )
         st.download_button(
             "Critical moments (CSV)", crit.to_csv(index=False).encode(), f"{stem}_critical_moments.csv", "text/csv"
+        )
+        st.download_button(
+            "Turntable rotations (CSV)",
+            turn_tab.to_csv(index=False).encode(),
+            f"{stem}_turntables.csv",
+            "text/csv",
+            disabled=turn_tab.empty,
         )
     with c2:
         st.download_button(
@@ -815,7 +992,7 @@ with tabs[6]:
 # --------------------------------------------------------------------------- #
 # Method
 # --------------------------------------------------------------------------- #
-with tabs[7]:
+with tab_meth:
     I_used = ClusterParams(**cluster_d).yaw_inertia()
     patch = res.patch
     st.markdown(
@@ -856,6 +1033,19 @@ centroid, so a linear acceleration produces almost pure sliding. Rotation appear
 rotates (turntables, yaw acceleration), (b) the load is concentrated on some supports, or (c) the friction is
 not uniform — a region with higher friction stays put and the rest of the cluster swings around it. Options
 (b) and (c) can be set in the sidebar to reproduce the observed behaviour.
+
+#### Turntable detection
+
+The gyroscope measures the carrier yaw rate directly. A rotation starts and ends where the (median-filtered)
+yaw rate crosses the rotation threshold; same-direction rotations separated by less than the merge gap are
+one turn, so a fast phase followed by a slow positioning phase counts as a single turn. The angle is the
+integral of the yaw rate. Each turn is split into an **entry** window (carrier stopping on the table), the
+**rotation** and an **exit** window (carrier leaving), and the friction demand on the cluster is evaluated in
+each phase.
+
+**Axis position.** For a carrier rotating about a fixed axis O the sensor S measures
+**a**ₛ = α ẑ × **r** − ω² **r** with **r** = S − O. A least-squares fit over the rotation samples gives **r**.
+The fit relies mainly on the spin-up and braking (α) and is therefore limited by the sample rate.
 
 #### Assumptions and limits
 

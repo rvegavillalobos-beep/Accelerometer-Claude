@@ -11,6 +11,8 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 - Transfers the carrier motion to the cluster centre, including turntable rotations (centripetal and tangential terms).
 - Planar stick-slip model with a distributed Coulomb friction contact (full-area or four corner supports,
   optional non-uniform friction per corner region).
+- Turntable detection from the gyroscope: angle, fast / slow phases, spin-up and braking, friction demand at
+  entry, rotation and exit, and an estimate of the turntable axis position relative to the sensor.
 - Animated top view (carrier or plant frame), friction demand vs. capacity, slip-event table with pivot location.
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings.
 - CSV / JSON export of all results.
@@ -34,6 +36,7 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `app.py` | Streamlit user interface |
 | `data_io.py` | WitMotion parser and signal pre-processing |
 | `slip_model.py` | Friction contact model, stick-slip simulation, event extraction |
+| `turns.py` | Turntable / rotation detection and analysis |
 | `visuals.py` | Plotly figures and the animated top view |
 
 ## Coordinate convention

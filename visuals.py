@@ -24,6 +24,7 @@ CRITICAL = "#d03b3b"
 MUTED = "#898781"
 INK_2 = "#52514e"
 CORNER_COLORS = [C1, C2, C3, C4]  # Front-Left, Front-Right, Rear-Right, Rear-Left
+SERIES = [C1, C2, C3, C4, "#e87ba4", "#008300", "#4a3aa7", "#e34948"]  # categorical order, never cycled
 CORNER_SHORT = ["FL", "FR", "RR", "RL"]
 
 PLOT_CONFIG = {"displaylogo": False, "toImageButtonOptions": {"format": "png", "scale": 2}}
@@ -642,3 +643,123 @@ def fig_compare(df: pd.DataFrame, mu_s: float) -> go.Figure:
         showlegend=False,
     )
     return fig
+
+
+# --------------------------------------------------------------------------- #
+# Turntables
+# --------------------------------------------------------------------------- #
+def fig_rotation_timeline(kin: Kinematics, res: SimulationResult, rotations, pad_s: float) -> go.Figure:
+    """Yaw rate, heading and friction demand with the detected rotations highlighted."""
+    t = res.t
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        subplot_titles=(
+            "Carrier yaw rate [deg/s]  (shaded: detected rotations)",
+            "Carrier heading [deg]  (integrated yaw rate)",
+            "Required friction coefficient  (light bands: turntable entry / exit windows)",
+        ),
+    )
+    fig.add_trace(_line(t, np.rad2deg(kin.wz), "Yaw rate", C1, showlegend=False, hover_fmt=".2f"), row=1, col=1)
+    fig.add_trace(_line(t, np.rad2deg(kin.heading), "Heading", C1, showlegend=False, hover_fmt=".1f"), row=2, col=1)
+    fig.add_trace(_line(t, np.clip(res.mu_req, 0, 5), "Required μ", C1, showlegend=False), row=3, col=1)
+    fig.add_hline(
+        y=res.contact.mu_s,
+        line=dict(color=CRITICAL, width=1.2),
+        annotation_text=f"μs = {res.contact.mu_s:.3f}",
+        annotation_position="top left",
+        annotation_font_color=CRITICAL,
+        row=3,
+        col=1,
+    )
+    for r in rotations:
+        turn = r.kind == "Turntable"
+        fill = "rgba(27,175,122,0.22)" if turn else "rgba(137,135,129,0.20)"
+        for row in (1, 2, 3):
+            fig.add_vrect(x0=r.t0, x1=r.t1, fillcolor=fill, line_width=0, layer="below", row=row, col=1)
+        if turn:
+            for row in (3,):
+                fig.add_vrect(
+                    x0=r.t0 - pad_s,
+                    x1=r.t0,
+                    fillcolor="rgba(235,104,52,0.10)",
+                    line_width=0,
+                    layer="below",
+                    row=row,
+                    col=1,
+                )
+                fig.add_vrect(
+                    x0=r.t1,
+                    x1=r.t1 + pad_s,
+                    fillcolor="rgba(235,104,52,0.10)",
+                    line_width=0,
+                    layer="below",
+                    row=row,
+                    col=1,
+                )
+        fig.add_annotation(
+            x=0.5 * (r.t0 + r.t1),
+            y=1.0,
+            xref="x",
+            yref="y domain",
+            text=f"{r.label.replace('Turn ', 'T').replace('Minor ', 'm')}<br>{r.angle_deg:+.0f}°",
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(size=11, color=INK_2),
+        )
+    _shade_slip(fig, res, rows=[3])
+    fig.update_xaxes(title_text="Time from recording start [s]", row=3, col=1)
+    return _base_layout(fig, 720)
+
+
+def fig_turn_profiles(kin: Kinematics, rotations, pre_s: float = 1.0, post_s: float = 2.0) -> go.Figure:
+    """Overlay of all turntable rotations aligned at their start: |yaw rate| and yaw acceleration."""
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        subplot_titles=(
+            "|Yaw rate| [deg/s]",
+            "Yaw acceleration in the turning direction [deg/s²]  (+ spin-up, − braking)",
+        ),
+    )
+    turns = [r for r in rotations if r.kind == "Turntable"][: len(SERIES)]
+    for n, r in enumerate(turns):
+        i0 = max(0, int(np.searchsorted(kin.t, r.t0 - pre_s)))
+        i1 = min(len(kin.t), int(np.searchsorted(kin.t, r.t1 + post_s)) + 1)
+        x = kin.t[i0:i1] - r.t0
+        sign = 1.0 if r.angle_deg >= 0 else -1.0
+        name = f"{r.label} ({r.angle_deg:+.1f}°)"
+        col = SERIES[n]
+        fig.add_trace(
+            go.Scattergl(
+                x=x,
+                y=np.abs(np.rad2deg(kin.wz[i0:i1])),
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                line=dict(color=col, width=2),
+                hovertemplate=name + ": %{y:.2f} °/s<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scattergl(
+                x=x,
+                y=sign * np.rad2deg(kin.alpha[i0:i1]),
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                showlegend=False,
+                line=dict(color=col, width=1.5),
+                hovertemplate=name + ": %{y:.1f} °/s²<extra></extra>",
+            ),
+            row=2,
+            col=1,
+        )
+    fig.update_xaxes(title_text="Time from rotation start [s]", row=2, col=1)
+    return _base_layout(fig, 560)

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Measurement data and videos: plant data must not be published
+*.txt
+!requirements.txt
+*.csv
+*.tsv
+*.log
+*.mp4
+*.mov
+*.m4v
+*.webm
+data/
