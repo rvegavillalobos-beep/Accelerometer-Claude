@@ -13,6 +13,8 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   optional non-uniform friction per corner region).
 - Turntable detection from the gyroscope: angle, fast / slow phases, spin-up and braking, friction demand at
   entry, rotation and exit, and an estimate of the turntable axis position relative to the sensor.
+- Dynamic friction limit μs·f_z: the friction capacity drops whenever the carrier bumps (vertical acceleration < 1 g).
+- Speed profile of the whole route (travel speed, start / stop ramps, longitudinal acceleration vs. friction limit).
 - Travel direction of the carrier per motion segment (auto-detected, manually editable) and a motion phase for
   every critical moment (accelerating, braking / stop, lateral load, stopped, rotating on turntable).
 - Animated top view (carrier or plant frame) with travel-direction arrow, friction demand vs. capacity,

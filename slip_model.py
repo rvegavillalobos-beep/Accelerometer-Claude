@@ -70,8 +70,8 @@ class ClusterParams:
 
 @dataclass(frozen=True)
 class ContactParams:
-    mu_s: float = 0.28
-    mu_k: float = 0.28
+    mu_s: float = 0.16
+    mu_k: float = 0.16
     model: str = "full"  # "full" | "corners"
     com_offset: tuple[float, float] = (0.0, 0.0)  # full-area model: CoM offset from geometric centre [m]
     corner_shares: tuple[float, float, float, float] = (25.0, 25.0, 25.0, 25.0)  # FL, FR, RR, RL [%]
@@ -767,6 +767,8 @@ def critical_moments(res: SimulationResult, kin: Kinematics, n: int = 10, min_se
                 "Carrier motion": "Turning" if is_turning(kin, i, i) else "Straight",
                 "Horiz. accel. at CoM [g]": round(float(res.fh_com[i]), 3),
                 "Vertical [g]": round(float(kin.fz[i]), 3),
+                "Dynamic limit [g]": round(float(res.contact.mu_s * max(kin.fz[i], 0.0)), 3),
+                "Z effect on demand": f"{(1.0 / kin.fz[i] - 1.0) * 100:+.0f}%" if kin.fz[i] > 0 else "lift-off",
                 "Yaw accel. [deg/s2]": round(float(np.rad2deg(kin.alpha[i])), 1),
                 "Predicted slip": "Yes" if res.sliding[max(i - 1, 0) : i + 2].any() else "No",
             }

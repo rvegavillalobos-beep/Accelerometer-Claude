@@ -235,3 +235,131 @@ def segments_table(segs: list[MotionSegment], overrides: dict | None = None) -> 
             for g in segs
         ]
     )
+
+
+# --------------------------------------------------------------------------- #
+# Speed profile along the route
+# --------------------------------------------------------------------------- #
+def speed_profile(
+    kin: Kinematics,
+    res: SimulationResult,
+    segs: list[MotionSegment],
+    overrides: dict | None = None,
+    max_reliable_s: float = 60.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    """Estimated travel speed for the whole record.
+
+    For each motion segment the acceleration along the travel direction is
+    integrated from rest to rest. A constant offset is removed so that the
+    speed returns to zero at the stop (zero-velocity update); this compensates
+    the small DC offsets that MEMS accelerometers show under vibration and
+    slight conveyor slopes. The estimate is reliable for segments of up to
+    about a minute; longer segments are flagged.
+
+    Returns (speed [m/s], longitudinal acceleration [g], quality code per sample, segment table).
+    Quality code: 0 = stopped, 1 = good, 2 = fair / poor (low reliability), 3 = unknown direction.
+    """
+    fs = kin.fs
+    n = len(kin.t)
+    v = np.zeros(n)
+    a_long = np.full(n, np.nan)
+    qual = np.zeros(n, dtype=int)
+    overrides = overrides or {}
+    pre = int(round(0.5 * fs))
+    rows = []
+    for k, g in enumerate(segs, start=1):
+        ov = overrides.get(segment_key(g), "Auto")
+        if ov == "Stopped" or g.auto_label.startswith("Rotating"):
+            continue
+        if ov in DIRECTIONS:
+            ux, uy = DIRECTIONS[ov]
+            dlabel, conf = ov, "Manual"
+        elif np.isfinite(g.ux):
+            ux, uy = g.ux, g.uy
+            dlabel, conf = g.auto_label, g.confidence
+        else:
+            v[g.i0 : g.i1 + 1] = np.nan
+            qual[g.i0 : g.i1 + 1] = 3
+            rows.append(
+                {"Segment": k, "Start [s]": round(g.t0, 1), "End [s]": round(g.t1, 1), "Quality": "Unknown direction"}
+            )
+            continue
+        a = max(0, g.i0 - pre)
+        b = min(n - 1, g.i1 + pre)
+        al = G0 * (res.fhx_com[a : b + 1] * ux + res.fhy_com[a : b + 1] * uy)
+        al = al - al.mean()  # zero-velocity update: speed back to 0 at the stop
+        vv = np.cumsum(al) / fs
+        vmax, vmin = float(vv.max()), float(vv.min())
+        dur = g.t1 - g.t0
+        if vmax < 0.05:
+            quality = "No significant travel"
+            vv[:] = 0.0
+        elif vmin < -0.15 * vmax:
+            quality = "Poor"
+        elif dur > max_reliable_s:
+            quality = "Fair"
+        else:
+            quality = "Good"
+        v[a : b + 1] = vv
+        a_long[a : b + 1] = al / G0
+        qual[a : b + 1] = 1 if quality == "Good" else (0 if quality == "No significant travel" else 2)
+        if quality == "No significant travel":
+            rows.append(
+                {
+                    "Segment": k,
+                    "Start [s]": round(g.t0, 1),
+                    "End [s]": round(g.t1, 1),
+                    "Duration [s]": round(dur, 1),
+                    "Direction": dlabel,
+                    "Quality": quality,
+                }
+            )
+            continue
+        vpos = np.clip(vv, 0.0, None)
+        cruise = float(np.median(vv[vv > 0.5 * vmax]))
+        up = np.where(vv >= 0.9 * cruise)[0]
+        i_up = int(up[0]) if len(up) else 0
+        i_dn = int(up[-1]) if len(up) else len(vv) - 1
+        acc_part = al[: max(i_up, 1) + 1]
+        dec_part = al[i_dn:]
+        mu_seg = res.mu_req[a : b + 1]
+        mu_seg = mu_seg[np.isfinite(mu_seg)]
+        rows.append(
+            {
+                "Segment": k,
+                "Start clock": pd.Timestamp(kin.clock[g.i0]).strftime("%H:%M:%S.%f")[:-3],
+                "Start [s]": round(g.t0, 1),
+                "End [s]": round(g.t1, 1),
+                "Duration [s]": round(dur, 1),
+                "Direction": dlabel,
+                "Direction confidence": conf,
+                "Quality": quality,
+                "Distance [m]": round(float(np.sum(vpos) / fs), 2),
+                "Cruise speed [m/s]": round(cruise, 2),
+                "Peak speed [m/s]": round(vmax, 2),
+                "Acceleration ramp [s]": round(i_up / fs, 1),
+                "Deceleration ramp [s]": round((len(vv) - 1 - i_dn) / fs, 1),
+                "Peak acceleration [g]": round(float(acc_part.max()) / G0, 3),
+                "Peak deceleration [g]": round(float(-dec_part.min()) / G0, 3),
+                "Max required mu": round(float(mu_seg.max()), 3) if len(mu_seg) else np.nan,
+            }
+        )
+    cols = [
+        "Segment",
+        "Start clock",
+        "Start [s]",
+        "End [s]",
+        "Duration [s]",
+        "Direction",
+        "Direction confidence",
+        "Quality",
+        "Distance [m]",
+        "Cruise speed [m/s]",
+        "Peak speed [m/s]",
+        "Acceleration ramp [s]",
+        "Deceleration ramp [s]",
+        "Peak acceleration [g]",
+        "Peak deceleration [g]",
+        "Max required mu",
+    ]
+    return v, a_long, qual, pd.DataFrame(rows, columns=cols)

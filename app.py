@@ -48,6 +48,7 @@ from motion import (
     detect_motion,
     motion_phase,
     segment_key,
+    speed_profile,
     segments_table,
     travel_arrays,
 )
@@ -68,7 +69,10 @@ from visuals import (
     fig_kinematics,
     fig_motion,
     fig_sweep,
+    fig_dynamic_limit,
     fig_rotation_timeline,
+    fig_speed_ramps,
+    fig_speed_timeline,
     fig_topview,
     fig_turn_profiles,
 )
@@ -316,10 +320,10 @@ with st.sidebar:
 
     with st.expander("5 · Friction contact", expanded=True):
         c1, c2 = st.columns(2)
-        mu_s = c1.number_input("Static μs", value=0.28, min_value=0.01, max_value=2.0, step=0.01, format="%.3f")
+        mu_s = c1.number_input("Static μs", value=0.16, min_value=0.01, max_value=2.0, step=0.01, format="%.3f")
         mu_k = c2.number_input(
             "Kinetic μk",
-            value=0.28,
+            value=0.16,
             min_value=0.01,
             max_value=2.0,
             step=0.01,
@@ -524,6 +528,7 @@ motion_segs = detect_motion(kin, res, rotations, travel_s)
 travel_ov_key = f"travel_ov_{active}"
 travel_overrides = st.session_state.get(travel_ov_key, {})
 travel = travel_arrays(kin, motion_segs, rotations, travel_overrides)
+speed, a_long, speed_q, speed_tab = speed_profile(kin, res, motion_segs, travel_overrides)
 
 
 def _phase_at(t_: float) -> str:
@@ -616,9 +621,15 @@ k4.metric("Final rotation", f"{sm['final_rot_deg']:.3f}°")
 k5, k6, k7, k8 = st.columns(4)
 k5.metric("Peak horizontal accel. at CoM", f"{sm['peak_fh_g']:.3f} g")
 k6.metric(
-    "Min. vertical accel.",
-    f"{sm['min_fz_g']:.3f} g",
-    help="Below 1 g the cluster is momentarily lighter and the friction capacity drops.",
+    "Lowest dynamic friction limit",
+    f"{mu_s * max(sm['min_fz_g'], 0.0):.3f} g",
+    f"{(max(sm['min_fz_g'], 0.0) - 1) * 100:+.0f}% vs static",
+    delta_color="normal",
+    help=(
+        "Highest horizontal acceleration the cluster can take without sliding = μs × vertical acceleration. "
+        f"At rest it equals μs ({mu_s:.3f} g); the minimum vertical acceleration in this record is "
+        f"{sm['min_fz_g']:.3f} g."
+    ),
 )
 k7.metric(
     "Turntable rotations",
@@ -632,6 +643,7 @@ tabs = st.tabs(
     [
         "Overview",
         "Turntables",
+        "Speed profile",
         "Top-view animation",
         "Signals",
         "Slip events",
@@ -641,13 +653,19 @@ tabs = st.tabs(
         "Method",
     ]
 )
-tab_over, tab_turn, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab_exp, tab_meth = tabs
+tab_over, tab_turn, tab_speed, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab_exp, tab_meth = tabs
 
 # --------------------------------------------------------------------------- #
 # Overview
 # --------------------------------------------------------------------------- #
 with tab_over:
     st.plotly_chart(fig_friction(res), config=PLOT_CONFIG, key="ov_friction")
+    st.plotly_chart(fig_dynamic_limit(kin, res), config=PLOT_CONFIG, key="ov_dynlimit")
+    st.caption(
+        "The friction limit is not constant: when the carrier bumps or drops (vertical acceleration below 1 g) the "
+        "cluster is momentarily lighter and the limit falls. Slip happens where the blue curve reaches the red one. "
+        "The required-μ chart above already includes this effect and the rotational load."
+    )
     st.markdown("##### Most critical moments")
     st.caption(
         "Highest friction demand along the record (slip or not). Use the clock time to find the moment in the video. "
@@ -728,6 +746,52 @@ with tab_turn:
         )
         st.plotly_chart(fig_friction(res, w0, w1), config=PLOT_CONFIG, key="tt_friction")
         st.plotly_chart(fig_kinematics(kin, res, w0, w1), config=PLOT_CONFIG, key="tt_kin")
+
+# --------------------------------------------------------------------------- #
+# Speed profile
+# --------------------------------------------------------------------------- #
+with tab_speed:
+    st.caption(
+        "Estimated travel speed of the carrier along the whole route. Each motion segment is integrated from rest to "
+        "rest along its travel direction (see Top-view animation → Travel direction per motion segment). The estimate "
+        "is good for segments of up to about a minute; longer segments without a stop accumulate error and are shown "
+        "in grey. Turntables are shown with their yaw rate."
+    )
+    good_tab = speed_tab[speed_tab["Quality"] == "Good"] if len(speed_tab) else speed_tab
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Motion segments", f"{len(good_tab)}", help="Segments with a usable speed estimate (Good or Fair).")
+    c2.metric(
+        "Typical cruise speed",
+        f"{good_tab['Cruise speed [m/s]'].median():.2f} m/s" if len(good_tab) else "-",
+        help="Median of the cruise speeds of the usable segments.",
+    )
+    c3.metric(
+        "Highest start acceleration",
+        f"{good_tab['Peak acceleration [g]'].max():.3f} g" if len(good_tab) else "-",
+    )
+    c4.metric(
+        "Highest braking deceleration",
+        f"{good_tab['Peak deceleration [g]'].max():.3f} g" if len(good_tab) else "-",
+        help="Includes stopper impacts. Compare with the dynamic friction limit μs·f_z.",
+    )
+    st.plotly_chart(
+        fig_speed_timeline(kin, res, speed, a_long, speed_q, rotations), config=PLOT_CONFIG, key="sp_timeline"
+    )
+    st.caption(
+        "Middle chart: when the acceleration along the travel direction reaches the red dynamic friction limit, the "
+        "start or stop ramp alone is enough to make the cluster slide."
+    )
+    st.markdown("##### Motion segments")
+    st.dataframe(speed_tab, hide_index=True)
+    st.markdown("##### Start and stop ramps")
+    st.caption(
+        "Reliable segments overlaid at their start and at their stop. A steeper curve means a harder ramp; "
+        "a sudden drop at the stop is a stopper impact."
+    )
+    if len(good_tab):
+        st.plotly_chart(fig_speed_ramps(kin, speed, speed_tab), config=PLOT_CONFIG, key="sp_ramps")
+    else:
+        st.info("No reliable motion segment in this record.")
 
 # --------------------------------------------------------------------------- #
 # Animation
@@ -1074,6 +1138,13 @@ with tab_exp:
             disabled=turn_tab.empty,
         )
         st.download_button(
+            "Speed profile per segment (CSV)",
+            speed_tab.to_csv(index=False).encode(),
+            f"{stem}_speed_segments.csv",
+            "text/csv",
+            disabled=speed_tab.empty,
+        )
+        st.download_button(
             "Motion segments / travel direction (CSV)",
             segments_table(motion_segs, travel_overrides).to_csv(index=False).encode(),
             f"{stem}_motion_segments.csv",
@@ -1162,6 +1233,23 @@ threshold. For each rolling period the velocity is integrated only over a short 
 offsets. When both windows give the same direction the confidence is *High*. The direction is snapped to the
 carrier axes (±X, ±Y) and can be overridden manually. The **Motion phase** column then tells whether a load
 occurred while the carrier was accelerating, braking / stopping, or as a lateral load.
+
+#### Dynamic friction limit
+
+The friction force available is μs·N and the normal load N = m·g₀·f_z follows the vertical acceleration. The
+largest horizontal acceleration the cluster can take is therefore μs·f_z (in g): at rest it equals μs, during a
+bump to 0.7 g it is 30 % lower. The column *Z effect on demand* in the critical moments shows how much the
+vertical acceleration raised the required μ at that instant. The **kinetic** friction coefficient μk cannot be
+derived from the carrier sensor: it only acts while the cluster slides. Measure it with a pull test (steady
+force while sliding ÷ weight) or with a second sensor on the cluster.
+
+#### Speed profile
+
+For every motion segment the acceleration along the travel direction is integrated from rest to rest. A constant
+offset is removed so that the speed returns to zero at the stop (zero-velocity update). This compensates the DC
+offset that MEMS accelerometers show under vibration and slight conveyor slopes. Segments longer than about a
+minute without a stop accumulate error and are flagged *Fair*; segments where the speed turns clearly negative
+are flagged *Poor*.
 
 #### Assumptions and limits
 

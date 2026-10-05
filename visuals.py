@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from scipy.ndimage import minimum_filter1d
 from plotly.subplots import make_subplots
 
 from data_io import Kinematics
@@ -135,6 +136,11 @@ def fig_kinematics(kin: Kinematics, res: SimulationResult, t0=None, t1=None) -> 
     fig.add_trace(_line(t, res.fhx_com[w], "X (length)", C1), row=1, col=1)
     fig.add_trace(_line(t, res.fhy_com[w], "Y (width)", C2), row=1, col=1)
     fig.add_trace(_line(t, res.fh_com[w], "Magnitude", C3), row=1, col=1)
+    fig.add_trace(
+        _line(t, res.contact.mu_s * np.clip(kin.fz[w], 0, None), "Dynamic friction limit μs·f_z", CRITICAL, width=1.2),
+        row=1,
+        col=1,
+    )
     fig.add_trace(_line(t, kin.fz[w], "Vertical", C1, showlegend=False), row=2, col=1)
     fig.add_trace(_line(t, np.rad2deg(kin.wz[w]), "Yaw rate", C1, showlegend=False, hover_fmt=".2f"), row=3, col=1)
     fig.add_trace(_line(t, np.rad2deg(kin.alpha[w]), "Yaw accel.", C1, showlegend=False, hover_fmt=".1f"), row=4, col=1)
@@ -813,3 +819,129 @@ def fig_turn_profiles(kin: Kinematics, rotations, pre_s: float = 1.0, post_s: fl
         )
     fig.update_xaxes(title_text="Time from rotation start [s]", row=2, col=1)
     return _base_layout(fig, 560)
+
+
+# --------------------------------------------------------------------------- #
+# Dynamic friction limit and speed profile
+# --------------------------------------------------------------------------- #
+def fig_dynamic_limit(kin: Kinematics, res: SimulationResult, t0=None, t1=None) -> go.Figure:
+    """Horizontal acceleration at the cluster CoM against the friction limit that moves with the vertical acceleration."""
+    w = _window(res, t0, t1)
+    t = res.t[w]
+    lim = res.contact.mu_s * np.clip(kin.fz[w], 0, None)
+    fig = go.Figure()
+    fig.add_trace(_line(t, res.fh_com[w], "Horizontal acceleration at cluster CoM", C1, width=1.5))
+    fig.add_trace(_line(t, lim, "Dynamic friction limit μs·f_z", CRITICAL, width=1.5))
+    fig.add_hline(
+        y=res.contact.mu_s,
+        line=dict(color=MUTED, width=1),
+        annotation_text=f"Static limit at 1 g = μs ({res.contact.mu_s:.3f} g)",
+        annotation_position="top left",
+    )
+    _shade_slip(fig, res, t0=t[0], t1=t[-1])
+    fig.update_yaxes(title_text="Acceleration [g]", rangemode="tozero")
+    fig.update_xaxes(title_text="Time from recording start [s]")
+    fig.update_layout(
+        title=dict(
+            text="Horizontal acceleration vs. dynamic friction limit (the limit drops when the vertical acceleration drops)",
+            x=0,
+            font=dict(size=14),
+        )
+    )
+    return _base_layout(fig, 380)
+
+
+def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, a_long, qual, rotations) -> go.Figure:
+    """Estimated travel speed, longitudinal acceleration vs. friction limit, and yaw rate for the whole record."""
+    t = res.t
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        subplot_titles=(
+            "Estimated travel speed [m/s]  (grey: low reliability, long segment without a stop)",
+            "Acceleration along the travel direction [g]  (+ speeding up, − braking) vs. dynamic friction limit (worst case in 0.5 s)",
+            "Carrier yaw rate [deg/s]  (turntables)",
+        ),
+    )
+    v_ok = np.where(qual == 2, np.nan, speed)
+    v_poor = np.where(qual == 2, speed, np.nan)
+    fig.add_trace(_line(t, v_ok, "Travel speed", C1, width=2, hover_fmt=".2f"), row=1, col=1)
+    fig.add_trace(_line(t, v_poor, "Travel speed (low reliability)", MUTED, width=1.5, hover_fmt=".2f"), row=1, col=1)
+    lim = minimum_filter1d(res.contact.mu_s * np.clip(kin.fz, 0, None), max(1, int(round(0.5 * kin.fs))))
+    fig.add_trace(_line(t, a_long, "Longitudinal acceleration", C1, showlegend=False), row=2, col=1)
+    fig.add_trace(_line(t, lim, "Dynamic friction limit μs·f_z", CRITICAL, width=1.2), row=2, col=1)
+    fig.add_trace(_line(t, -lim, "−Dynamic friction limit", CRITICAL, width=1.2, showlegend=False), row=2, col=1)
+    fig.add_trace(_line(t, np.rad2deg(kin.wz), "Yaw rate", C1, showlegend=False, hover_fmt=".1f"), row=3, col=1)
+    for r in rotations:
+        if r.kind == "Turntable":
+            for row in (1, 2, 3):
+                fig.add_vrect(
+                    x0=r.t0, x1=r.t1, fillcolor="rgba(27,175,122,0.22)", line_width=0, layer="below", row=row, col=1
+                )
+            fig.add_annotation(
+                x=0.5 * (r.t0 + r.t1),
+                y=1.0,
+                xref="x",
+                yref="y domain",
+                text=r.label.replace("Turn ", "T"),
+                showarrow=False,
+                yanchor="bottom",
+                font=dict(size=11, color=INK_2),
+            )
+    _shade_slip(fig, res, rows=[2])
+    fig.update_yaxes(rangemode="tozero", row=1, col=1)
+    fig.update_xaxes(title_text="Time from recording start [s]", row=3, col=1)
+    return _base_layout(fig, 760)
+
+
+def fig_speed_ramps(kin: Kinematics, speed, seg_table: pd.DataFrame, window_s: float = 10.0) -> go.Figure:
+    """Start and stop ramps of the reliable motion segments, overlaid to compare stations."""
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_yaxes=True,
+        horizontal_spacing=0.06,
+        subplot_titles=("Start ramps (aligned at the start)", "Stop ramps (aligned at the stop)"),
+    )
+    good = seg_table[seg_table["Quality"] == "Good"] if len(seg_table) else seg_table
+    for n, (_, row) in enumerate(good.head(len(SERIES)).iterrows()):
+        name = f"Seg {int(row['Segment'])} · {str(row['Direction']).split(' (')[0]} · {row['Start clock']}"
+        col = SERIES[n]
+        t0, t1 = float(row["Start [s]"]), float(row["End [s]"])
+        i0 = int(np.searchsorted(kin.t, t0 - 1.0))
+        i1 = int(np.searchsorted(kin.t, min(t1, t0 + window_s)))
+        fig.add_trace(
+            go.Scattergl(
+                x=kin.t[i0:i1] - t0,
+                y=speed[i0:i1],
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                line=dict(color=col, width=2),
+                hovertemplate=name + ": %{y:.2f} m/s<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
+        j0 = int(np.searchsorted(kin.t, max(t0, t1 - window_s)))
+        j1 = int(np.searchsorted(kin.t, t1 + 1.0))
+        fig.add_trace(
+            go.Scattergl(
+                x=kin.t[j0:j1] - t1,
+                y=speed[j0:j1],
+                mode="lines",
+                name=name,
+                legendgroup=name,
+                showlegend=False,
+                line=dict(color=col, width=2),
+                hovertemplate=name + ": %{y:.2f} m/s<extra></extra>",
+            ),
+            row=1,
+            col=2,
+        )
+    fig.update_xaxes(title_text="Time from start [s]", row=1, col=1)
+    fig.update_xaxes(title_text="Time to stop [s]", row=1, col=2)
+    fig.update_yaxes(title_text="Speed [m/s]", rangemode="tozero", row=1, col=1)
+    return _base_layout(fig, 420)
