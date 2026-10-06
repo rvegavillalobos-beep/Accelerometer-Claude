@@ -198,6 +198,7 @@ class Kinematics:
     flipped: bool = False
     bias: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    t_native: np.ndarray = field(default_factory=lambda: np.zeros(0))  # native sample times inside the window [s]
 
     @property
     def dt(self) -> float:
@@ -395,6 +396,7 @@ def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
         flipped=flipped,
         bias=bias,
         warnings=warnings,
+        t_native=t_native[(t_native >= t0) & (t_native <= t1)],
     )
 
 

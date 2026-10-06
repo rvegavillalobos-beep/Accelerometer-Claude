@@ -948,3 +948,94 @@ def fig_speed_ramps(kin: Kinematics, speed, seg_table: pd.DataFrame, window_s: f
     fig.update_xaxes(title_text="Time to stop [s]", row=1, col=2)
     fig.update_yaxes(title_text="Speed [m/s]", rangemode="tozero", row=1, col=1)
     return _base_layout(fig, 420)
+
+
+# --------------------------------------------------------------------------- #
+# Measure tab
+# --------------------------------------------------------------------------- #
+def fig_measure_overview(kin: Kinematics, res: SimulationResult, rotations, w0: float, w1: float) -> go.Figure:
+    """Whole-record strip used to pick the zoom window (drag to select)."""
+    t = res.t
+    fig = go.Figure()
+    fig.add_trace(_line(t, res.fh_com, "Horizontal accel. at CoM [g]", C1, showlegend=False, max_points=2000))
+    for r in rotations:
+        if r.kind == "Turntable":
+            fig.add_vrect(x0=r.t0, x1=r.t1, fillcolor="rgba(27,175,122,0.22)", line_width=0, layer="below")
+    fig.add_vrect(x0=w0, x1=w1, fillcolor="rgba(235,104,52,0.25)", line=dict(color=C2, width=1.5), layer="below")
+    fig.update_layout(
+        height=200,
+        margin=dict(l=10, r=10, t=40, b=10),
+        title=dict(
+            text="Whole record · drag across it to choose the zoom window (orange). Green = turntables.",
+            x=0,
+            font=dict(size=13),
+        ),
+        dragmode="select",
+        selectdirection="h",
+        hovermode="x unified",
+        showlegend=False,
+    )
+    fig.update_yaxes(title_text="g")
+    fig.update_xaxes(title_text="Time from recording start [s]", hoverformat=".2f")
+    return fig
+
+
+def fig_measure_detail(
+    kin: Kinematics, signals: dict, w0: float, w1: float, a: float, b: float, max_points: int = 20000
+) -> go.Figure:
+    """Full-resolution view of the zoom window with the measured interval A-B.
+
+    signals: {label: (array over kin.t, number format)}; lines are the simulation-rate signal, markers the
+    samples actually recorded by the sensor.
+    """
+    names = list(signals.keys())
+    n = max(1, len(names))
+    fig = make_subplots(rows=n, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=names)
+    i0 = max(0, int(np.searchsorted(kin.t, w0)) - 1)
+    i1 = min(len(kin.t), int(np.searchsorted(kin.t, w1, side="right")) + 1)
+    t = kin.t[i0:i1]
+    tn = kin.t_native[(kin.t_native >= w0) & (kin.t_native <= w1)] if len(kin.t_native) else np.zeros(0)
+    for k, name in enumerate(names, start=1):
+        y_all, fmt = signals[name]
+        y = np.asarray(y_all, dtype=float)[i0:i1]
+        col = SERIES[(k - 1) % len(SERIES)]
+        fig.add_trace(
+            _line(t, y, name, col, width=1.5, showlegend=False, max_points=max_points, hover_fmt=fmt), row=k, col=1
+        )
+        if len(tn):
+            yn = np.interp(tn, kin.t, np.nan_to_num(np.asarray(y_all, dtype=float), nan=0.0))
+            fig.add_trace(
+                go.Scatter(
+                    x=tn,
+                    y=yn,
+                    mode="markers",
+                    marker=dict(color=col, size=6, line=dict(color="#fcfcfb", width=1)),
+                    name="Recorded samples",
+                    showlegend=False,
+                    hovertemplate="sample %{x:.3f} s<extra></extra>",
+                ),
+                row=k,
+                col=1,
+            )
+    lo, hi = min(a, b), max(a, b)
+    fig.add_vrect(x0=lo, x1=hi, fillcolor="rgba(235,104,52,0.15)", line_width=0, layer="below", row="all", col=1)
+    for x, lab in ((lo, "A"), (hi, "B")):
+        fig.add_vline(x=x, line=dict(color=C2, width=1.5), row="all", col=1)
+    fig.add_annotation(
+        x=lo, y=1.0, xref="x", yref="paper", text="A", showarrow=False, yanchor="bottom", font=dict(color=C2, size=13)
+    )
+    fig.add_annotation(
+        x=hi, y=1.0, xref="x", yref="paper", text="B", showarrow=False, yanchor="bottom", font=dict(color=C2, size=13)
+    )
+    fig.update_xaxes(range=[w0, w1], hoverformat=".3f", showspikes=True, spikemode="across", spikethickness=1)
+    fig.update_xaxes(title_text="Time from recording start [s]", row=n, col=1)
+    fig.update_layout(
+        height=max(320, 190 * n),
+        margin=dict(l=10, r=10, t=60, b=10),
+        hovermode="x unified",
+        dragmode="select",
+        selectdirection="h",
+        uirevision=f"{w0:.3f}-{w1:.3f}",
+        showlegend=False,
+    )
+    return fig
