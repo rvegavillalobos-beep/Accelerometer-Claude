@@ -223,7 +223,7 @@ _multi_day = len({ts.date() for ts in rec_start.values()}) > 1
 def _recording_label(name: str) -> str:
     ts = rec_start[name]
     when = ts.strftime("%Y-%m-%d %H:%M:%S") if _multi_day else ts.strftime("%H:%M:%S")
-    return f"{when} · {name} · {rec_dur[name] / 60:.1f} min"
+    return f"{name} · {when} · {rec_dur[name] / 60:.1f} min"
 
 
 with st.sidebar:
@@ -243,6 +243,12 @@ with st.sidebar:
         step=0.1,
         key=f"win_{active}",
         help="Restrict the analysis to one conveyor section.",
+    )
+    measure_on = st.toggle(
+        "Measure mode",
+        value=False,
+        help="Drag across a time chart from one point to another to measure the time between them, the distance, "
+        "rotation and friction demand in that interval.",
     )
     ts_label = st.selectbox(
         "Timestamp handling",
@@ -548,7 +554,96 @@ motion_segs = detect_motion(kin, res, rotations, travel_s)
 travel_ov_key = f"travel_ov_{active}"
 travel_overrides = st.session_state.get(travel_ov_key, {})
 travel = travel_arrays(kin, motion_segs, rotations, travel_overrides)
-speed, a_long, speed_q, speed_tab = speed_profile(kin, res, motion_segs, travel_overrides)
+travel_speed, a_long, speed_q, speed_tab = speed_profile(kin, res, motion_segs, travel_overrides)
+
+
+# --------------------------------------------------------------------------- #
+# Measure mode: drag across a time chart to measure an interval
+# --------------------------------------------------------------------------- #
+def _selected_range(event) -> tuple[float, float] | None:
+    """x-range of a box selection returned by st.plotly_chart(on_select=...)."""
+    if event is None:
+        return None
+    try:
+        sel = event["selection"]
+    except (KeyError, TypeError):
+        sel = getattr(event, "selection", None)
+    if not sel:
+        return None
+    xs: list[float] = []
+    for box in sel.get("box") or []:
+        x = box.get("x") if isinstance(box, dict) else None
+        if x is not None and len(x) >= 2:
+            xs.extend([float(x[0]), float(x[-1])])
+    if not xs:
+        for p in sel.get("points") or []:
+            if isinstance(p, dict) and p.get("x") is not None:
+                xs.append(float(p["x"]))
+    if len(xs) < 2 or max(xs) - min(xs) <= 0:
+        return None
+    return min(xs), max(xs)
+
+
+def _show_measurement(a: float, b: float):
+    a, b = max(a, float(kin.t[0])), min(b, float(kin.t[-1]))
+    i0 = int(np.searchsorted(kin.t, a))
+    i1 = max(i0, int(np.searchsorted(kin.t, b, side="right")) - 1)
+    sl = slice(i0, i1 + 1)
+    dt = b - a
+    sp = np.nan_to_num(travel_speed[sl], nan=0.0)
+    dist = float(np.sum(np.clip(sp, 0.0, None)) / kin.fs)
+    mu_i = res.mu_req[sl]
+    mu_i = mu_i[np.isfinite(mu_i)]
+    mu_max = float(mu_i.max()) if len(mu_i) else float("nan")
+    d_head = float(np.rad2deg(kin.heading[i1] - kin.heading[i0]))
+    d_corner = (
+        float(
+            np.max(
+                np.hypot(
+                    res.corner_xy[i1, :, 0] - res.corner_xy[i0, :, 0],
+                    res.corner_xy[i1, :, 1] - res.corner_xy[i0, :, 1],
+                )
+            )
+            * 1e3
+        )
+        if i1 > i0
+        else 0.0
+    )
+    with st.container(border=True):
+        st.markdown(
+            f"**Measured interval:** {a:.2f} → {b:.2f} s  ·  {fmt_clock(kin.clock[i0])} → {fmt_clock(kin.clock[i1])}"
+        )
+        m = st.columns(6)
+        m[0].metric("Δt", f"{dt:.2f} s")
+        m[1].metric("Distance ≈", f"{dist:.2f} m", help="From the estimated travel speed (Speed profile tab).")
+        m[2].metric("Mean speed ≈", f"{dist / dt:.2f} m/s" if dt > 0 else "-")
+        m[3].metric("Carrier rotation", f"{d_head:+.1f}°")
+        m[4].metric(
+            "Max required μ",
+            f"{mu_max:.3f}" if np.isfinite(mu_max) else "-",
+            f"{(mu_s / mu_max - 1) * 100:+.0f}% margin" if np.isfinite(mu_max) and mu_max > 0 else None,
+        )
+        m[5].metric("Max horiz. accel.", f"{float(res.fh_com[sl].max()):.3f} g")
+        st.caption(
+            f"Slip predicted in the interval: {'yes' if res.sliding[sl].any() else 'no'} · "
+            f"cluster corner shift in the interval: {d_corner:.2f} mm · "
+            f"lowest vertical acceleration: {float(kin.fz[sl].min()):.3f} g · "
+            f"from {locate(a, rotations, turn_s.pad_s)} to {locate(b, rotations, turn_s.pad_s)}."
+        )
+
+
+def measure_chart(fig, key: str):
+    """Render a time chart; in measure mode a horizontal drag selects an interval and shows its figures."""
+    if not measure_on:
+        st.plotly_chart(fig, config=PLOT_CONFIG, key=key)
+        return
+    fig.update_layout(dragmode="select", selectdirection="h")
+    event = st.plotly_chart(fig, config=PLOT_CONFIG, key=f"{key}_measure", on_select="rerun", selection_mode="box")
+    rng = _selected_range(event)
+    if rng is not None:
+        _show_measurement(*rng)
+    else:
+        st.caption("Measure mode: drag across the chart from one point to another. Double-click the chart to clear.")
 
 
 def _phase_at(t_: float) -> str:
@@ -679,8 +774,8 @@ tab_over, tab_turn, tab_speed, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab
 # Overview
 # --------------------------------------------------------------------------- #
 with tab_over:
-    st.plotly_chart(fig_friction(res), config=PLOT_CONFIG, key="ov_friction")
-    st.plotly_chart(fig_dynamic_limit(kin, res), config=PLOT_CONFIG, key="ov_dynlimit")
+    measure_chart(fig_friction(res), key="ov_friction")
+    measure_chart(fig_dynamic_limit(kin, res), key="ov_dynlimit")
     st.caption(
         "The friction limit is not constant: when the carrier bumps or drops (vertical acceleration below 1 g) the "
         "cluster is momentarily lighter and the limit falls. Slip happens where the blue curve reaches the red one. "
@@ -722,7 +817,7 @@ with tab_turn:
             f"{mu_near:.3f}" if np.isfinite(mu_near) else "-",
             f"{(mu_s / mu_near - 1) * 100:+.0f}% margin vs μs" if np.isfinite(mu_near) and mu_near > 0 else None,
         )
-        st.plotly_chart(fig_rotation_timeline(kin, res, rotations, turn_s.pad_s), config=PLOT_CONFIG, key="tt_timeline")
+        measure_chart(fig_rotation_timeline(kin, res, rotations, turn_s.pad_s), key="tt_timeline")
         st.markdown("##### Detected rotations")
         st.dataframe(turn_tab, hide_index=True)
 
@@ -764,8 +859,8 @@ with tab_turn:
             args=(w0, w1),
             help="Sets the animation window to this turn; then open the Top-view animation tab.",
         )
-        st.plotly_chart(fig_friction(res, w0, w1), config=PLOT_CONFIG, key="tt_friction")
-        st.plotly_chart(fig_kinematics(kin, res, w0, w1), config=PLOT_CONFIG, key="tt_kin")
+        measure_chart(fig_friction(res, w0, w1), key="tt_friction")
+        measure_chart(fig_kinematics(kin, res, w0, w1), key="tt_kin")
 
 # --------------------------------------------------------------------------- #
 # Speed profile
@@ -794,9 +889,7 @@ with tab_speed:
         f"{good_tab['Peak deceleration [g]'].max():.3f} g" if len(good_tab) else "-",
         help="Includes stopper impacts. Compare with the dynamic friction limit μs·f_z.",
     )
-    st.plotly_chart(
-        fig_speed_timeline(kin, res, speed, a_long, speed_q, rotations), config=PLOT_CONFIG, key="sp_timeline"
-    )
+    measure_chart(fig_speed_timeline(kin, res, travel_speed, a_long, speed_q, rotations), key="sp_timeline")
     st.caption(
         "Middle chart: when the acceleration along the travel direction reaches the red dynamic friction limit, the "
         "start or stop ramp alone is enough to make the cluster slide."
@@ -809,7 +902,7 @@ with tab_speed:
         "a sudden drop at the stop is a stopper impact."
     )
     if len(good_tab):
-        st.plotly_chart(fig_speed_ramps(kin, speed, speed_tab), config=PLOT_CONFIG, key="sp_ramps")
+        st.plotly_chart(fig_speed_ramps(kin, travel_speed, speed_tab), config=PLOT_CONFIG, key="sp_ramps")
     else:
         st.info("No reliable motion segment in this record.")
 
@@ -840,7 +933,7 @@ with tab_anim:
         help="Defaults to ±15 s around the largest slip event, or around the most critical moment.",
     )
     view = c2.radio("View", ["Carrier (GOT fixed)", "Plant (carrier rotates)"], key="view")
-    speed = c3.selectbox("Playback speed", [0.25, 0.5, 1.0, 2.0, 5.0, 10.0], index=2, format_func=lambda v: f"{v:g}×")
+    play_speed = c3.selectbox("Playback speed", [0.25, 0.5, 1.0, 2.0, 5.0, 10.0], index=2, format_func=lambda v: f"{v:g}×")
     nfr = c4.selectbox("Max. frames", [300, 600, 1000], index=1)
     sl = slice(int(np.searchsorted(res.t, a_win[0])), int(np.searchsorted(res.t, a_win[1], side="right")))
     k_auto = auto_exaggeration(res, slice(0, len(res.t)))
@@ -866,7 +959,7 @@ with tab_anim:
                 exaggeration=k_use,
                 plant_view=view.startswith("Plant"),
                 max_frames=int(nfr),
-                playback_speed=float(speed),
+                playback_speed=float(play_speed),
                 travel=travel,
             ),
             config=PLOT_CONFIG,
@@ -920,7 +1013,7 @@ with tab_anim:
                     },
                 )
                 st.button("Reset manual directions", on_click=_reset_travel_overrides)
-        st.plotly_chart(fig_motion(res, tol_mm, a_win[0], a_win[1]), config=PLOT_CONFIG, key="anim_motion")
+        measure_chart(fig_motion(res, tol_mm, a_win[0], a_win[1]), key="anim_motion")
         st.markdown("##### Corner paths in the animation window")
         st.caption(
             "Each panel sits where the corner is on the cluster (Front to the right, Left at the top). A corner that barely moves while the others travel indicates pivoting about that corner."
@@ -931,7 +1024,7 @@ with tab_anim:
 # Signals
 # --------------------------------------------------------------------------- #
 with tab_sig:
-    st.plotly_chart(fig_kinematics(kin, res), config=PLOT_CONFIG, key="sig_kin")
+    measure_chart(fig_kinematics(kin, res), key="sig_kin")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("##### Recording diagnostics")
@@ -995,10 +1088,10 @@ with tab_ev:
         pad_s = max(1.0, 2.0 * float(ev["Duration [s]"]))
         e0 = max(float(kin.t[0]), float(ev["Start [s]"]) - pad_s)
         e1 = min(float(kin.t[-1]), float(ev["End [s]"]) + pad_s)
-        st.plotly_chart(fig_friction(res, e0, e1), config=PLOT_CONFIG, key="ev_friction")
+        measure_chart(fig_friction(res, e0, e1), key="ev_friction")
         c1, c2 = st.columns([3, 2])
         with c1:
-            st.plotly_chart(fig_motion(res, tol_mm, e0, e1), config=PLOT_CONFIG, key="ev_motion")
+            measure_chart(fig_motion(res, tol_mm, e0, e1), key="ev_motion")
         with c2:
             st.plotly_chart(fig_corner_paths(res, e0, e1), config=PLOT_CONFIG, key="ev_corners")
 

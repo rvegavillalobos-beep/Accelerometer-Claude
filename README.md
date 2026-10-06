@@ -19,6 +19,8 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   every critical moment (accelerating, braking / stop, lateral load, stopped, rotating on turntable).
 - Animated top view (carrier or plant frame) with travel-direction arrow, friction demand vs. capacity,
   slip-event table with pivot location.
+- Measure mode: drag across any time chart to measure the interval (Δt, clock times, distance, mean speed,
+  carrier rotation, maximum friction demand, slip).
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings.
 - CSV / JSON export of all results.
 
