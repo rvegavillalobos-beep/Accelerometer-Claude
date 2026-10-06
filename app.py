@@ -201,18 +201,38 @@ for f in uploads:
 
 # Validate files
 valid: dict[str, bytes] = {}
+rec_start: dict[str, pd.Timestamp] = {}
+rec_dur: dict[str, float] = {}
 for name, data in files.items():
     try:
-        load_raw(data, name)
+        _raw = load_raw(data, name)
         valid[name] = data
+        rec_start[name] = pd.Timestamp(_raw.df["clock"].iloc[0])
+        rec_dur[name] = recording_duration(_raw)
     except Exception as exc:  # noqa: BLE001
         st.sidebar.error(f"{name}: {exc}")
 if not valid:
     st.error("None of the uploaded files could be read as a WitMotion export.")
     st.stop()
 
+# oldest -> newest, using the first timestamp inside each file
+valid = dict(sorted(valid.items(), key=lambda kv: (rec_start[kv[0]], kv[0])))
+_multi_day = len({ts.date() for ts in rec_start.values()}) > 1
+
+
+def _recording_label(name: str) -> str:
+    ts = rec_start[name]
+    when = ts.strftime("%Y-%m-%d %H:%M:%S") if _multi_day else ts.strftime("%H:%M:%S")
+    return f"{when} · {name} · {rec_dur[name] / 60:.1f} min"
+
+
 with st.sidebar:
-    active = st.selectbox("Active recording", list(valid.keys()))
+    active = st.selectbox(
+        "Active recording",
+        list(valid.keys()),
+        format_func=_recording_label,
+        help="Sorted by the first timestamp inside each file (oldest first).",
+    )
     raw = load_raw(valid[active], active)
     dur = recording_duration(raw)
     win = st.slider(
@@ -1053,7 +1073,8 @@ with tab_cmp:
         st.info("Upload two or more recordings to compare them (e.g. before / after a conveyor adjustment).")
     else:
         st.caption(
-            "Every recording is simulated over its full length with the current mounting, cluster and friction settings."
+            "Every recording is simulated over its full length with the current mounting, cluster and friction "
+            "settings. Recordings are listed in time order (oldest first)."
         )
         rows = []
         with st.spinner("Simulating all recordings..."):

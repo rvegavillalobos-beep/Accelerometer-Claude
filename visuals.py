@@ -674,7 +674,7 @@ def fig_sweep(
 
 
 def fig_compare(df: pd.DataFrame, mu_s: float) -> go.Figure:
-    d = df.sort_values("Required μ (no slip)")
+    d = df  # keep the given (chronological) order, oldest at the top
     fig = go.Figure(
         go.Bar(
             x=d["Required μ (no slip)"],
@@ -699,6 +699,7 @@ def fig_compare(df: pd.DataFrame, mu_s: float) -> go.Figure:
         xaxis_title="Required μ [-]",
         bargap=0.35,
         showlegend=False,
+        yaxis=dict(autorange="reversed"),
     )
     return fig
 
