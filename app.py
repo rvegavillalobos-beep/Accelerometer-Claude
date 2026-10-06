@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -79,7 +81,14 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.3.0"
+
+# Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
+# objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
+_CALC_MODULES = ("data_io.py", "slip_model.py", "turns.py", "motion.py")
+CACHE_V = hashlib.md5(
+    b"".join(Path(__file__).with_name(f).read_bytes() for f in _CALC_MODULES if Path(__file__).with_name(f).exists())
+).hexdigest()[:12]
 
 st.set_page_config(page_title="GOT Cluster Slip Simulator", page_icon="🔋", layout="wide")
 
@@ -88,19 +97,27 @@ st.set_page_config(page_title="GOT Cluster Slip Simulator", page_icon="🔋", la
 # Cached computation layer
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False, max_entries=32)
-def load_raw(data: bytes, name: str) -> RawRecording:
+def _load_raw_cached(cache_v: str, data: bytes, name: str) -> RawRecording:
     return read_witmotion(data, name)
 
 
+def load_raw(data: bytes, name: str) -> RawRecording:
+    return _load_raw_cached(CACHE_V, data, name)
+
+
 @st.cache_data(show_spinner=False, max_entries=32)
-def load_kinematics(data: bytes, name: str, pre: dict):
+def _load_kinematics_cached(cache_v: str, data: bytes, name: str, pre: dict):
     raw = load_raw(data, name)
     return preprocess(raw, PreprocessSettings(**pre))
 
 
+def load_kinematics(data: bytes, name: str, pre: dict):
+    return _load_kinematics_cached(CACHE_V, data, name, pre)
+
+
 @st.cache_data(show_spinner=False, max_entries=12)
-def run_simulation(
-    data: bytes, name: str, pre: dict, cluster: dict, contact: dict, sensor: dict, solver: dict
+def _run_simulation_cached(
+    cache_v: str, data: bytes, name: str, pre: dict, cluster: dict, contact: dict, sensor: dict, solver: dict
 ) -> SimulationResult:
     kin = load_kinematics(data, name, pre)
     return simulate(
@@ -108,8 +125,15 @@ def run_simulation(
     )
 
 
+def run_simulation(
+    data: bytes, name: str, pre: dict, cluster: dict, contact: dict, sensor: dict, solver: dict
+) -> SimulationResult:
+    return _run_simulation_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver)
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
-def run_sweep(
+def _run_sweep_cached(
+    cache_v: str,
     data: bytes,
     name: str,
     pre: dict,
@@ -130,6 +154,21 @@ def run_sweep(
         SolverParams(**solver),
         keep_ratio=keep_ratio,
     )
+
+
+def run_sweep(data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio) -> pd.DataFrame:
+    return _run_sweep_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio)
+
+
+@contextmanager
+def tab_guard(tab_name: str):
+    """Keep an error in one tab from stopping the rest of the app (st.stop / st.rerun pass through)."""
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"The {tab_name} tab could not be displayed: {type(exc).__name__}: {exc}")
+        with st.expander("Technical details"):
+            st.exception(exc)
 
 
 def fmt_clock(ts) -> str:
@@ -756,7 +795,7 @@ tab_over, tab_meas, tab_turn, tab_speed, tab_anim, tab_sig, tab_ev, tab_sens, ta
 # --------------------------------------------------------------------------- #
 # Overview
 # --------------------------------------------------------------------------- #
-with tab_over:
+with tab_over, tab_guard("Overview"):
     st.plotly_chart(fig_friction(res), config=PLOT_CONFIG, key="ov_friction")
     st.plotly_chart(fig_dynamic_limit(kin, res), config=PLOT_CONFIG, key="ov_dynlimit")
     st.caption(
@@ -774,7 +813,7 @@ with tab_over:
 # --------------------------------------------------------------------------- #
 # Measure
 # --------------------------------------------------------------------------- #
-with tab_meas:
+with tab_meas, tab_guard("Measure"):
     st.caption(
         "Measure precise time intervals. 1) Drag across the whole-record strip to choose a zoom window. "
         "2) In the zoomed chart, drag from point A to point B, or type A and B below (to the millisecond). "
@@ -869,7 +908,7 @@ with tab_meas:
 # --------------------------------------------------------------------------- #
 # Turntables
 # --------------------------------------------------------------------------- #
-with tab_turn:
+with tab_turn, tab_guard("Turntables"):
     st.caption(
         "Carrier rotations are detected from the gyroscope yaw rate and their angle is its integral. "
         "Entry and exit windows cover the carrier stopping on the table and leaving it."
@@ -943,7 +982,7 @@ with tab_turn:
 # --------------------------------------------------------------------------- #
 # Speed profile
 # --------------------------------------------------------------------------- #
-with tab_speed:
+with tab_speed, tab_guard("Speed profile"):
     st.caption(
         "Estimated travel speed of the carrier along the whole route. Each motion segment is integrated from rest to "
         "rest along its travel direction (see Top-view animation → Travel direction per motion segment). The estimate "
@@ -989,7 +1028,7 @@ with tab_speed:
 # --------------------------------------------------------------------------- #
 # Animation
 # --------------------------------------------------------------------------- #
-with tab_anim:
+with tab_anim, tab_guard("Top-view animation"):
     if len(res.events):
         ev = res.events.iloc[int(np.argmax(res.events["Max corner shift [mm]"].to_numpy()))]
         centre = 0.5 * (ev["Start [s]"] + ev["End [s]"])
@@ -1105,7 +1144,7 @@ with tab_anim:
 # --------------------------------------------------------------------------- #
 # Signals
 # --------------------------------------------------------------------------- #
-with tab_sig:
+with tab_sig, tab_guard("Signals"):
     st.plotly_chart(fig_kinematics(kin, res), config=PLOT_CONFIG, key="sig_kin")
     c1, c2 = st.columns(2)
     with c1:
@@ -1151,7 +1190,7 @@ with tab_sig:
 # --------------------------------------------------------------------------- #
 # Slip events
 # --------------------------------------------------------------------------- #
-with tab_ev:
+with tab_ev, tab_guard("Slip events"):
     if res.events.empty:
         st.info(
             "No slip predicted with the current parameters. The 'Most critical moments' table in the Overview tab "
@@ -1209,7 +1248,7 @@ with tab_ev:
 # --------------------------------------------------------------------------- #
 # Friction sensitivity
 # --------------------------------------------------------------------------- #
-with tab_sens:
+with tab_sens, tab_guard("Friction sensitivity"):
     st.caption(
         "Repeats the simulation for a range of static friction coefficients (same record and settings). "
         "Use it to judge how sensitive the result is to surface condition, contamination or material changes."
@@ -1243,7 +1282,7 @@ with tab_sens:
 # --------------------------------------------------------------------------- #
 # Compare recordings
 # --------------------------------------------------------------------------- #
-with tab_cmp:
+with tab_cmp, tab_guard("Compare recordings"):
     if len(valid) < 2:
         st.info("Upload two or more recordings to compare them (e.g. before / after a conveyor adjustment).")
     else:
@@ -1292,7 +1331,7 @@ with tab_cmp:
 # --------------------------------------------------------------------------- #
 # Export
 # --------------------------------------------------------------------------- #
-with tab_exp:
+with tab_exp, tab_guard("Export"):
     stem = active.rsplit(".", 1)[0]
     params = {
         "app_version": APP_VERSION,
@@ -1365,7 +1404,7 @@ with tab_exp:
 # --------------------------------------------------------------------------- #
 # Method
 # --------------------------------------------------------------------------- #
-with tab_meth:
+with tab_meth, tab_guard("Method"):
     I_used = ClusterParams(**cluster_d).yaw_inertia()
     patch = res.patch
     st.markdown(

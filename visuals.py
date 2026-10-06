@@ -994,7 +994,8 @@ def fig_measure_detail(
     i0 = max(0, int(np.searchsorted(kin.t, w0)) - 1)
     i1 = min(len(kin.t), int(np.searchsorted(kin.t, w1, side="right")) + 1)
     t = kin.t[i0:i1]
-    tn = kin.t_native[(kin.t_native >= w0) & (kin.t_native <= w1)] if len(kin.t_native) else np.zeros(0)
+    t_nat = getattr(kin, "t_native", None)  # absent in kinematics cached by older app versions
+    tn = t_nat[(t_nat >= w0) & (t_nat <= w1)] if t_nat is not None and len(t_nat) else np.zeros(0)
     for k, name in enumerate(names, start=1):
         y_all, fmt = signals[name]
         y = np.asarray(y_all, dtype=float)[i0:i1]
