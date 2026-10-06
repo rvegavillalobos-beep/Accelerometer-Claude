@@ -35,7 +35,7 @@ PLOT_CONFIG = {"displaylogo": False, "toImageButtonOptions": {"format": "png", "
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def _envelope(x: np.ndarray, y: np.ndarray, max_points: int = 6000) -> tuple[np.ndarray, np.ndarray]:
+def _envelope(x: np.ndarray, y: np.ndarray, max_points: int = 3000) -> tuple[np.ndarray, np.ndarray]:
     """Min/max decimation that keeps peaks visible."""
     n = len(x)
     if n <= max_points:
@@ -59,9 +59,11 @@ def _envelope(x: np.ndarray, y: np.ndarray, max_points: int = 6000) -> tuple[np.
     return np.asarray(xs), np.asarray(ys)
 
 
-def _line(x, y, name, color, width=1.5, showlegend=True, max_points=6000, hover_fmt=".3f"):
+def _line(x, y, name, color, width=1.5, showlegend=True, max_points=3000, hover_fmt=".3f"):
+    # SVG traces on purpose: browsers allow only 8-16 WebGL contexts per page, and Streamlit renders every tab at
+    # once, so WebGL (Scattergl) charts beyond that limit go blank. The min/max decimation keeps SVG fast.
     xd, yd = _envelope(np.asarray(x), np.asarray(y, dtype=float), max_points)
-    return go.Scattergl(
+    return go.Scatter(
         x=xd,
         y=yd,
         mode="lines",
@@ -791,7 +793,7 @@ def fig_turn_profiles(kin: Kinematics, rotations, pre_s: float = 1.0, post_s: fl
         name = f"{r.label} ({r.angle_deg:+.1f}°)"
         col = SERIES[n]
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=x,
                 y=np.abs(np.rad2deg(kin.wz[i0:i1])),
                 mode="lines",
@@ -804,7 +806,7 @@ def fig_turn_profiles(kin: Kinematics, rotations, pre_s: float = 1.0, post_s: fl
             col=1,
         )
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=x,
                 y=sign * np.rad2deg(kin.alpha[i0:i1]),
                 mode="lines",
@@ -913,7 +915,7 @@ def fig_speed_ramps(kin: Kinematics, speed, seg_table: pd.DataFrame, window_s: f
         i0 = int(np.searchsorted(kin.t, t0 - 1.0))
         i1 = int(np.searchsorted(kin.t, min(t1, t0 + window_s)))
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=kin.t[i0:i1] - t0,
                 y=speed[i0:i1],
                 mode="lines",
@@ -928,7 +930,7 @@ def fig_speed_ramps(kin: Kinematics, speed, seg_table: pd.DataFrame, window_s: f
         j0 = int(np.searchsorted(kin.t, max(t0, t1 - window_s)))
         j1 = int(np.searchsorted(kin.t, t1 + 1.0))
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=kin.t[j0:j1] - t1,
                 y=speed[j0:j1],
                 mode="lines",
