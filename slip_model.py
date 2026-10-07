@@ -37,6 +37,10 @@ Coordinate frame: X along the cluster length ("Front" = +X), Y along the width
 
 from __future__ import annotations
 
+import os as _os
+
+_LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale modules
+
 from dataclasses import dataclass, field
 
 import numpy as np

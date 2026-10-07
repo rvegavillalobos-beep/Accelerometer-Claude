@@ -23,6 +23,10 @@ friction contact, so no explicit gravity removal is needed:
 
 from __future__ import annotations
 
+import os as _os
+
+_LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale modules
+
 import io
 from dataclasses import dataclass, field
 

@@ -7,6 +7,10 @@ Plotly figures for the GOT cluster slip simulator.
 
 from __future__ import annotations
 
+import os as _os
+
+_LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale modules
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go

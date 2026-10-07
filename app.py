@@ -19,9 +19,39 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
+import importlib
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+# Local modules in dependency order. After a git push, Streamlit Cloud can rerun the new app.py while older
+# versions of these modules are still loaded in the Python process (ImportError on new names). Every module
+# stores the mtime of its source file when it is loaded; if any file on disk is newer, all are reloaded.
+_LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "visuals")
+
+
+def _reload_stale_local_modules() -> None:
+    stale = False
+    for _name in _LOCAL_MODULES:
+        _mod = sys.modules.get(_name)
+        _file = getattr(_mod, "__file__", None) if _mod is not None else None
+        if not _file:
+            continue
+        try:
+            if getattr(_mod, "_LOADED_MTIME", None) != os.path.getmtime(_file):
+                stale = True
+        except OSError:
+            continue
+    if stale:
+        for _name in _LOCAL_MODULES:
+            if _name in sys.modules:
+                importlib.reload(sys.modules[_name])
+
+
+_reload_stale_local_modules()
 
 from data_io import (
     PreprocessSettings,

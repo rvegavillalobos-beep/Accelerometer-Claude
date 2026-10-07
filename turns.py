@@ -21,6 +21,10 @@ For every rotation the module reports
 
 from __future__ import annotations
 
+import os as _os
+
+_LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale modules
+
 from dataclasses import dataclass
 
 import numpy as np
