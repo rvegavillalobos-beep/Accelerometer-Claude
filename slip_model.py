@@ -774,3 +774,28 @@ def critical_moments(res: SimulationResult, kin: Kinematics, n: int = 10, min_se
             }
         )
     return pd.DataFrame(rows)
+
+
+def exceedance_peaks(
+    res: SimulationResult, kin: Kinematics, mu_s: float | None = None, merge_s: float = 1.0
+) -> pd.DataFrame:
+    """Distinct moments where the required μ exceeds μs (cluster in nominal position).
+
+    Exceedances closer than merge_s seconds are counted as one event (one physical jolt). One row per event
+    with its peak.
+    """
+    thr = res.contact.mu_s if mu_s is None else float(mu_s)
+    mu = np.where(np.isfinite(res.mu_req_initial), res.mu_req_initial, 10.0)
+    segs = _segments(mu > thr, merge_gap=max(0, int(round(merge_s * kin.fs))))
+    rows = []
+    for a, b in segs:
+        i = a + int(np.argmax(mu[a : b + 1]))
+        rows.append(
+            {
+                "Clock": pd.Timestamp(res.clock[i]).strftime("%H:%M:%S.%f")[:-3],
+                "Time [s]": round(float(res.t[i]), 2),
+                "Peak required mu": round(float(mu[i]), 3),
+                "Time above μs [s]": round(float(np.sum(mu[a : b + 1] > thr)) / kin.fs, 2),
+            }
+        )
+    return pd.DataFrame(rows, columns=["Clock", "Time [s]", "Peak required mu", "Time above μs [s]"])

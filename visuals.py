@@ -673,16 +673,55 @@ def fig_sweep(
     return f1, f2
 
 
-def fig_compare(df: pd.DataFrame, mu_s: float) -> go.Figure:
+def fig_compare(df: pd.DataFrame, mu_s: float, peaks: dict | None = None) -> go.Figure:
+    """Required μ per recording (bar = maximum) with every exceedance of μs marked at its peak value."""
     d = df  # keep the given (chronological) order, oldest at the top
+    peaks = peaks or {}
     fig = go.Figure(
         go.Bar(
             x=d["Required μ (no slip)"],
             y=d["Recording"],
             orientation="h",
             marker=dict(color=C1),
-            hovertemplate="%{y}<br>Required μ %{x:.3f}<extra></extra>",
-            name="Required μ",
+            hovertemplate="%{y}<br>Highest required μ %{x:.3f}<extra></extra>",
+            name="Highest required μ",
+        )
+    )
+    # orange marks: one per exceedance of μs, at its peak
+    xs, ys, hov = [], [], []
+    for name in d["Recording"]:
+        pk = peaks.get(name)
+        if pk is None or len(pk) == 0:
+            continue
+        for n, row in enumerate(pk.itertuples(index=False), start=1):
+            xs.append(float(row[2]))
+            ys.append(name)
+            hov.append(f"{name}<br>Exceedance {n} of {len(pk)} · {row[0]}<br>Peak required μ {float(row[2]):.3f}")
+    bar_h = max(10, int(0.6 * 45))
+    if xs:
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="markers",
+                marker=dict(symbol="line-ns", size=bar_h, line=dict(color=C2, width=3), color=C2),
+                name="Exceedance of μs (peak)",
+                hovertext=hov,
+                hoverinfo="text",
+            )
+        )
+    # count of exceedances at the end of each bar
+    counts = [len(peaks.get(n, [])) for n in d["Recording"]]
+    fig.add_trace(
+        go.Scatter(
+            x=d["Required μ (no slip)"],
+            y=d["Recording"],
+            mode="text",
+            text=[f"  {c}×" if c else "  0" for c in counts],
+            textposition="middle right",
+            textfont=dict(size=12, color=INK_2),
+            hoverinfo="skip",
+            showlegend=False,
         )
     )
     fig.add_vline(
@@ -692,14 +731,21 @@ def fig_compare(df: pd.DataFrame, mu_s: float) -> go.Figure:
         annotation_position="top",
         annotation_font_color=CRITICAL,
     )
+    xmax = float(np.nanmax(np.r_[d["Required μ (no slip)"].to_numpy(dtype=float), mu_s])) if len(d) else mu_s
     fig.update_layout(
-        title=dict(text="Friction coefficient required to avoid any slip", x=0, font=dict(size=14)),
-        height=max(260, 70 + 45 * len(d)),
+        title=dict(
+            text="Friction coefficient required to avoid any slip · orange = each time μs is exceeded",
+            x=0,
+            font=dict(size=14),
+        ),
+        height=max(260, 90 + 45 * len(d)),
         margin=dict(l=10, r=10, t=50, b=10),
-        xaxis_title="Required μ [-]",
+        xaxis=dict(title_text="Required μ [-]", range=[0, xmax * 1.12]),
         bargap=0.35,
-        showlegend=False,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         yaxis=dict(autorange="reversed"),
+        hovermode="closest",
     )
     return fig
 

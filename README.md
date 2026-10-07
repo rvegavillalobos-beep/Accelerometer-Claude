@@ -22,7 +22,8 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 - Measure tab: pick a zoom window on the whole-record strip, then measure an interval A–B at full resolution
   (recorded samples shown, A and B adjustable to the millisecond) with Δt, clock times, distance, mean speed,
   carrier rotation, maximum friction demand and slip.
-- Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings.
+- Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings
+  (highest required μ per recording, plus every distinct exceedance of μs marked at its peak and counted).
 - CSV / JSON export of all results.
 
 ## Run locally

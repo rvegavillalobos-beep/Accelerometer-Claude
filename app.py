@@ -39,6 +39,7 @@ from slip_model import (
     SimulationResult,
     SolverParams,
     critical_moments,
+    exceedance_peaks,
     friction_sweep,
     results_table,
     simulate,
@@ -1291,6 +1292,7 @@ with tab_cmp, tab_guard("Compare recordings"):
             "settings. Recordings are listed in time order (oldest first)."
         )
         rows = []
+        peaks_map: dict[str, pd.DataFrame] = {}
         with st.spinner("Simulating all recordings..."):
             for name, d in valid.items():
                 pre_full = dict(pre, t_start=None, t_end=None)
@@ -1302,6 +1304,8 @@ with tab_cmp, tab_guard("Compare recordings"):
                     continue
                 s_i = summary(res_i, kin_i)
                 n_turn_i = sum(r.kind == "Turntable" for r in detect_rotations(kin_i, turn_s))
+                pk_i = exceedance_peaks(res_i, kin_i, mu_s)
+                peaks_map[name] = pk_i
                 rows.append(
                     {
                         "Recording": name,
@@ -1310,6 +1314,8 @@ with tab_cmp, tab_guard("Compare recordings"):
                         "Native rate [Hz]": round(kin_i.fs_native, 1),
                         "Required μ (no slip)": round(s_i["mu_noslip"], 3),
                         "Margin vs μs": f"{(s_i['margin'] - 1) * 100:+.0f}%",
+                        "Exceedances of μs": len(pk_i),
+                        "Exceedance times": ", ".join(pk_i["Clock"].tolist()[:12]) + (" …" if len(pk_i) > 12 else ""),
                         "Slip events": s_i["n_events"],
                         "Slip time [s]": round(s_i["slip_time_s"], 2),
                         "Final max corner shift [mm]": round(s_i["final_corner_mm"], 2),
@@ -1322,7 +1328,12 @@ with tab_cmp, tab_guard("Compare recordings"):
                 )
         if rows:
             cmp_df = pd.DataFrame(rows)
-            st.plotly_chart(fig_compare(cmp_df, mu_s), config=PLOT_CONFIG, key="cmp")
+            st.plotly_chart(fig_compare(cmp_df, mu_s, peaks_map), config=PLOT_CONFIG, key="cmp")
+            st.caption(
+                "Bar = highest friction coefficient required in the recording. Orange marks = every distinct moment "
+                "in which the required μ exceeds μs, at its peak value (exceedances less than 1 s apart count as "
+                "one). The number at the end of each bar is how many times μs is exceeded."
+            )
             st.dataframe(cmp_df, hide_index=True)
             st.download_button(
                 "Download comparison (CSV)", cmp_df.to_csv(index=False).encode(), "comparison.csv", "text/csv"
