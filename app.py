@@ -22,6 +22,8 @@ from pathlib import Path
 import importlib
 import os
 import sys
+import time
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -127,7 +129,9 @@ st.set_page_config(page_title="GOT Cluster Slip Simulator", page_icon="🔋", la
 # --------------------------------------------------------------------------- #
 # Cached computation layer
 # --------------------------------------------------------------------------- #
-@st.cache_data(show_spinner=False, max_entries=32)
+# Cache sizes are bounded and entries expire, so memory does not grow without limit on Streamlit Cloud
+# (a container that runs out of memory is restarted and every open browser loses its connection).
+@st.cache_data(show_spinner=False, max_entries=64, ttl=6 * 3600)
 def _load_raw_cached(cache_v: str, data: bytes, name: str) -> RawRecording:
     return read_witmotion(data, name)
 
@@ -136,7 +140,7 @@ def load_raw(data: bytes, name: str) -> RawRecording:
     return _load_raw_cached(CACHE_V, data, name)
 
 
-@st.cache_data(show_spinner=False, max_entries=32)
+@st.cache_data(show_spinner=False, max_entries=16, ttl=2 * 3600)
 def _load_kinematics_cached(cache_v: str, data: bytes, name: str, pre: dict):
     raw = load_raw(data, name)
     return preprocess(raw, PreprocessSettings(**pre))
@@ -146,7 +150,7 @@ def load_kinematics(data: bytes, name: str, pre: dict):
     return _load_kinematics_cached(CACHE_V, data, name, pre)
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
+@st.cache_data(show_spinner=False, max_entries=8, ttl=2 * 3600)
 def _run_simulation_cached(
     cache_v: str, data: bytes, name: str, pre: dict, cluster: dict, contact: dict, sensor: dict, solver: dict
 ) -> SimulationResult:
@@ -162,7 +166,7 @@ def run_simulation(
     return _run_simulation_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=8, ttl=2 * 3600)
 def _run_sweep_cached(
     cache_v: str,
     data: bytes,
@@ -204,6 +208,86 @@ def tab_guard(tab_name: str):
 
 def fmt_clock(ts) -> str:
     return pd.Timestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+
+
+@st.cache_data(show_spinner=False, max_entries=400, ttl=6 * 3600)
+def _compare_row_cached(
+    cache_v: str,
+    data: bytes,
+    name: str,
+    pre: dict,
+    cluster: dict,
+    contact: dict,
+    sensor: dict,
+    solver: dict,
+    turn_d: dict,
+    mu_s: float,
+) -> tuple[dict, pd.DataFrame]:
+    """Summary of one recording for the comparison tab. Only the small summary is cached (a few kB), not the
+    full simulation, so many recordings can be compared without filling the memory or recomputing on every click."""
+    kin_i = preprocess(load_raw(data, name), PreprocessSettings(**pre))
+    res_i = simulate(
+        kin_i, ClusterParams(**cluster), ContactParams(**contact), SensorGeometry(**sensor), SolverParams(**solver)
+    )
+    s_i = summary(res_i, kin_i)
+    n_turn_i = sum(r.kind == "Turntable" for r in detect_rotations(kin_i, TurnSettings(**turn_d)))
+    pk_i = exceedance_peaks(res_i, kin_i, mu_s)
+    row = {
+        "Recording": name,
+        "Start": fmt_clock(kin_i.clock[0]),
+        "Duration [s]": round(kin_i.duration, 1),
+        "Native rate [Hz]": round(kin_i.fs_native, 1),
+        "Required μ (no slip)": round(s_i["mu_noslip"], 3),
+        "Margin vs μs": f"{(s_i['margin'] - 1) * 100:+.0f}%",
+        "Exceedances of μs": len(pk_i),
+        "Exceedance times": ", ".join(pk_i["Clock"].tolist()[:12]) + (" …" if len(pk_i) > 12 else ""),
+        "Slip events": s_i["n_events"],
+        "Slip time [s]": round(s_i["slip_time_s"], 2),
+        "Final max corner shift [mm]": round(s_i["final_corner_mm"], 2),
+        "Final rotation [deg]": round(s_i["final_rot_deg"], 3),
+        "Peak horiz. accel. [g]": round(s_i["peak_fh_g"], 3),
+        "Min. vertical [g]": round(s_i["min_fz_g"], 3),
+        "Peak yaw accel. [deg/s2]": round(s_i["peak_yaw_acc_deg_s2"], 1),
+        "Turntable rotations": n_turn_i,
+    }
+    return row, pk_i
+
+
+def compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s) -> tuple[dict, pd.DataFrame]:
+    return _compare_row_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver, turn_d, float(mu_s))
+
+
+# --------------------------------------------------------------------------- #
+# Uploaded files survive a page reload
+# --------------------------------------------------------------------------- #
+# A browser that loses its connection (idle tab, sleep, network change) gets a new, empty session when the page
+# is reloaded. The uploaded files are therefore also kept in server memory under a random id that lives in the
+# page URL (?ws=...), and restored after a reload. Entries expire after 12 h and the total size is capped.
+_WS_TTL_S = 12 * 3600
+_WS_MAX_BYTES = 300_000_000
+
+
+@st.cache_resource
+def _upload_store() -> dict:
+    return {}
+
+
+def _store_prune(store: dict, keep: str | None = None) -> None:
+    now = time.time()
+    for k in [k for k, v in list(store.items()) if now - v["t"] > _WS_TTL_S]:
+        store.pop(k, None)
+    total = sum(sum(len(b) for b in v["files"].values()) for v in store.values())
+    for k, _v in sorted(store.items(), key=lambda kv: kv[1]["t"]):
+        if total <= _WS_MAX_BYTES:
+            break
+        if k != keep:
+            total -= sum(len(b) for b in store[k]["files"].values())
+            store.pop(k, None)
+
+
+def _clear_restored_files(ws: str) -> None:
+    _upload_store().pop(ws, None)
+    st.session_state["_restored_base"] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -258,18 +342,44 @@ with st.sidebar:
         help="Tab-separated export of the WitMotion software. Several files can be uploaded and compared.",
     )
 
-if not uploads:
-    landing()
-    st.stop()
+ws_id = st.query_params.get("ws")
+if not ws_id:
+    ws_id = uuid.uuid4().hex[:16]
+    st.query_params["ws"] = ws_id
+_store = _upload_store()
+_store_prune(_store, keep=ws_id)
 
 files: dict[str, bytes] = {}
-for f in uploads:
+if "_restored_base" not in st.session_state:
+    # new browser session (first visit or page reload): restore the files kept for this URL, if any
+    _entry = _store.get(ws_id)
+    st.session_state["_restored_base"] = dict(_entry["files"]) if _entry else {}
+files.update(st.session_state["_restored_base"])
+for f in uploads or []:
     name = f.name
     i = 2
-    while name in files:
+    while name in files and name not in st.session_state["_restored_base"]:
         name = f"{f.name} ({i})"
         i += 1
     files[name] = f.getvalue()
+if uploads or files:
+    _store[ws_id] = {"files": dict(files), "t": time.time()}
+if st.session_state.get("_had_uploads") and not uploads and not st.session_state["_restored_base"]:
+    _store.pop(ws_id, None)  # the user removed every uploaded file
+    files = {}
+st.session_state["_had_uploads"] = bool(uploads)
+
+if st.session_state["_restored_base"]:
+    with st.sidebar:
+        st.info(
+            f"{len(st.session_state['_restored_base'])} file(s) restored after the page was reloaded. "
+            "Upload more files to add them, or clear the restored ones."
+        )
+        st.button("Clear restored files", on_click=_clear_restored_files, args=(ws_id,))
+
+if not files:
+    landing()
+    st.stop()
 
 # Validate files
 valid: dict[str, bytes] = {}
@@ -1324,38 +1434,17 @@ with tab_cmp, tab_guard("Compare recordings"):
         rows = []
         peaks_map: dict[str, pd.DataFrame] = {}
         with st.spinner("Simulating all recordings..."):
+            pre_full = dict(pre, t_start=None, t_end=None)
             for name, d in valid.items():
-                pre_full = dict(pre, t_start=None, t_end=None)
                 try:
-                    kin_i = load_kinematics(d, name, pre_full)
-                    res_i = run_simulation(d, name, pre_full, cluster_d, contact_d, sensor_d, solver_d)
+                    row_i, pk_i = compare_row(
+                        d, name, pre_full, cluster_d, contact_d, sensor_d, solver_d, asdict(turn_s), mu_s
+                    )
                 except Exception as exc:  # noqa: BLE001
                     st.warning(f"{name}: {exc}")
                     continue
-                s_i = summary(res_i, kin_i)
-                n_turn_i = sum(r.kind == "Turntable" for r in detect_rotations(kin_i, turn_s))
-                pk_i = exceedance_peaks(res_i, kin_i, mu_s)
                 peaks_map[name] = pk_i
-                rows.append(
-                    {
-                        "Recording": name,
-                        "Start": fmt_clock(kin_i.clock[0]),
-                        "Duration [s]": round(kin_i.duration, 1),
-                        "Native rate [Hz]": round(kin_i.fs_native, 1),
-                        "Required μ (no slip)": round(s_i["mu_noslip"], 3),
-                        "Margin vs μs": f"{(s_i['margin'] - 1) * 100:+.0f}%",
-                        "Exceedances of μs": len(pk_i),
-                        "Exceedance times": ", ".join(pk_i["Clock"].tolist()[:12]) + (" …" if len(pk_i) > 12 else ""),
-                        "Slip events": s_i["n_events"],
-                        "Slip time [s]": round(s_i["slip_time_s"], 2),
-                        "Final max corner shift [mm]": round(s_i["final_corner_mm"], 2),
-                        "Final rotation [deg]": round(s_i["final_rot_deg"], 3),
-                        "Peak horiz. accel. [g]": round(s_i["peak_fh_g"], 3),
-                        "Min. vertical [g]": round(s_i["min_fz_g"], 3),
-                        "Peak yaw accel. [deg/s2]": round(s_i["peak_yaw_acc_deg_s2"], 1),
-                        "Turntable rotations": n_turn_i,
-                    }
-                )
+                rows.append(row_i)
         if rows:
             cmp_df = pd.DataFrame(rows)
             st.plotly_chart(fig_compare(cmp_df, mu_s, peaks_map), config=PLOT_CONFIG, key="cmp")

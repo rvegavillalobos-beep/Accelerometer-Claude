@@ -25,6 +25,8 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings
   (highest required μ per recording, plus every distinct exceedance of μs marked at its peak and counted).
 - CSV / JSON export of all results.
+- Uploaded files survive a page reload: they are kept in server memory (max. 12 h) under a random id in the page
+  URL (`?ws=...`), so reloading after a lost connection restores them.
 
 ## Run locally
 
