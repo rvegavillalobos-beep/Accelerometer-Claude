@@ -1273,11 +1273,13 @@ with tab_speed, tab_guard("Speed profile"):
         help="Includes stopper impacts. Compare with the dynamic friction limit μs·f_z.",
     )
     st.plotly_chart(
-        fig_speed_timeline(kin, res, travel_speed, a_long, speed_q, rotations), config=PLOT_CONFIG, key="sp_timeline"
+        fig_speed_timeline(kin, res, travel_speed, speed_q, rotations), config=PLOT_CONFIG, key="sp_timeline"
     )
     st.caption(
-        "Middle chart: when the acceleration along the travel direction reaches the red dynamic friction limit, the "
-        "start or stop ramp alone is enough to make the cluster slide."
+        "Middle chart: same friction demand as in the Turntables tab (translation + rotation, in g) against the "
+        "dynamic friction limit μs·f_z, which drops when the vertical acceleration drops. Where the demand reaches "
+        "the limit the cluster slides; read it together with the speed above to see whether a start ramp, a stop, "
+        "a stopper impact or a turntable causes it."
     )
     st.markdown("##### Motion segments")
     st.dataframe(speed_tab, hide_index=True)

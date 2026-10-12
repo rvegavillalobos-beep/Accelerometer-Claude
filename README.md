@@ -18,7 +18,7 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 - Turntable comparison: pick a turn in one recording and a turn in another (or the same) recording and overlay
   yaw rate, friction demand vs. dynamic limit and yaw acceleration, aligned at the turn start or end.
 - Dynamic friction limit μs·f_z: the friction capacity drops whenever the carrier bumps (vertical acceleration < 1 g).
-- Speed profile of the whole route (travel speed, start / stop ramps, longitudinal acceleration vs. friction limit).
+- Speed profile of the whole route (travel speed, start / stop ramps, friction demand vs. dynamic friction limit).
 - Travel direction of the carrier per motion segment (auto-detected, manually editable) and a motion phase for
   every critical moment (accelerating, braking / stop, lateral load, stopped, rotating on turntable).
 - Animated top view (carrier or plant frame) with travel-direction arrow, friction demand vs. capacity,

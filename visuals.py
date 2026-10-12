@@ -14,7 +14,6 @@ _LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale mo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from scipy.ndimage import minimum_filter1d
 from plotly.subplots import make_subplots
 
 from data_io import Kinematics
@@ -964,8 +963,8 @@ def fig_dynamic_limit(kin: Kinematics, res: SimulationResult, t0=None, t1=None) 
     return _base_layout(fig, 380)
 
 
-def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, a_long, qual, rotations) -> go.Figure:
-    """Estimated travel speed, longitudinal acceleration vs. friction limit, and yaw rate for the whole record."""
+def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, qual, rotations) -> go.Figure:
+    """Estimated travel speed, friction demand vs. dynamic friction limit, and yaw rate for the whole record."""
     t = res.t
     fig = make_subplots(
         rows=3,
@@ -974,7 +973,7 @@ def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, a_long, qu
         vertical_spacing=0.07,
         subplot_titles=(
             "Estimated travel speed [m/s]  (grey: low reliability, long segment without a stop)",
-            "Acceleration along the travel direction [g]  (+ speeding up, − braking) vs. dynamic friction limit (worst case in 0.5 s)",
+            "Friction demand vs. dynamic friction limit [g]  (red bands = predicted slip)",
             "Carrier yaw rate [deg/s]  (turntables)",
         ),
     )
@@ -982,10 +981,10 @@ def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, a_long, qu
     v_poor = np.where(qual == 2, speed, np.nan)
     fig.add_trace(_line(t, v_ok, "Travel speed", C1, width=2, hover_fmt=".2f"), row=1, col=1)
     fig.add_trace(_line(t, v_poor, "Travel speed (low reliability)", MUTED, width=1.5, hover_fmt=".2f"), row=1, col=1)
-    lim = minimum_filter1d(res.contact.mu_s * np.clip(kin.fz, 0, None), max(1, int(round(0.5 * kin.fs))))
-    fig.add_trace(_line(t, a_long, "Longitudinal acceleration", C1, showlegend=False), row=2, col=1)
-    fig.add_trace(_line(t, lim, "Dynamic friction limit μs·f_z", CRITICAL, width=1.2), row=2, col=1)
-    fig.add_trace(_line(t, -lim, "−Dynamic friction limit", CRITICAL, width=1.2, showlegend=False), row=2, col=1)
+    fig.add_trace(_line(t, friction_demand_g(res, kin), "Friction demand", C1, width=1.5), row=2, col=1)
+    fig.add_trace(
+        _line(t, dynamic_limit_g(res, kin), "Dynamic friction limit μs·f_z", CRITICAL, width=1.2), row=2, col=1
+    )
     fig.add_trace(_line(t, np.rad2deg(kin.wz), "Yaw rate", C1, showlegend=False, hover_fmt=".1f"), row=3, col=1)
     for r in rotations:
         if r.kind == "Turntable":
@@ -1005,6 +1004,7 @@ def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, a_long, qu
             )
     _shade_slip(fig, res, rows=[2])
     fig.update_yaxes(rangemode="tozero", row=1, col=1)
+    fig.update_yaxes(rangemode="tozero", row=2, col=1)
     fig.update_xaxes(title_text="Time from recording start [s]", row=3, col=1)
     return _base_layout(fig, 760)
 
