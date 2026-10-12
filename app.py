@@ -100,14 +100,18 @@ from visuals import (
     auto_exaggeration,
     fig_compare,
     fig_corner_paths,
+    friction_demand_g,
     fig_friction,
     fig_kinematics,
     fig_motion,
     fig_sweep,
+    dynamic_limit_g,
     fig_dynamic_limit,
     fig_measure_detail,
     fig_measure_overview,
     fig_rotation_timeline,
+    fig_turn_compare,
+    fig_turn_detail,
     fig_speed_ramps,
     fig_speed_timeline,
     fig_topview,
@@ -941,8 +945,8 @@ with tab_over, tab_guard("Overview"):
     st.plotly_chart(fig_dynamic_limit(kin, res), config=PLOT_CONFIG, key="ov_dynlimit")
     st.caption(
         "The friction limit is not constant: when the carrier bumps or drops (vertical acceleration below 1 g) the "
-        "cluster is momentarily lighter and the limit falls. Slip happens where the blue curve reaches the red one. "
-        "The required-μ chart above already includes this effect and the rotational load."
+        "cluster is momentarily lighter and the limit falls. The blue curve is the friction the cluster needs "
+        "(required μ × vertical acceleration, including turntable rotation). Slip happens where it reaches the red one."
     )
     st.markdown("##### Most critical moments")
     st.caption(
@@ -1117,8 +1121,12 @@ with tab_turn, tab_guard("Turntables"):
             args=(w0, w1),
             help="Sets the animation window to this turn; then open the Top-view animation tab.",
         )
-        st.plotly_chart(fig_friction(res, w0, w1), config=PLOT_CONFIG, key="tt_friction")
-        st.plotly_chart(fig_kinematics(kin, res, w0, w1), config=PLOT_CONFIG, key="tt_kin")
+        st.plotly_chart(fig_turn_detail(kin, res, w0, w1), config=PLOT_CONFIG, key="tt_detail")
+        st.caption(
+            "Friction demand = required μ × vertical acceleration: the friction the cluster needs, including the "
+            "turntable rotational load, expressed in g. Dynamic friction limit = μs × vertical acceleration: the "
+            "friction available, which drops on bumps. Where the blue curve reaches the red one, the cluster slips."
+        )
 
 # --------------------------------------------------------------------------- #
 # Speed profile
@@ -1457,6 +1465,106 @@ with tab_cmp, tab_guard("Compare recordings"):
             st.download_button(
                 "Download comparison (CSV)", cmp_df.to_csv(index=False).encode(), "comparison.csv", "text/csv"
             )
+
+    # ------------------------------------------------------------------ #
+    # Compare turntable rotations between recordings
+    # ------------------------------------------------------------------ #
+    st.divider()
+    st.markdown("##### Compare turntable rotations")
+    st.caption(
+        "Pick a turn in one recording and a turn in another (or in the same) recording. The curves are aligned "
+        "at the chosen point and overlaid: yaw rate, friction demand against the dynamic friction limit, and yaw "
+        "acceleration."
+    )
+    rec_names = list(valid.keys())
+    pre_full = dict(pre, t_start=None, t_end=None)
+
+    def _turn_data(rec: str):
+        d_ = valid[rec]
+        kin_x = load_kinematics(d_, rec, pre_full)
+        res_x = run_simulation(d_, rec, pre_full, cluster_d, contact_d, sensor_d, solver_d)
+        rots_x = [r for r in detect_rotations(kin_x, turn_s) if r.kind == "Turntable"]
+        return kin_x, res_x, rots_x
+
+    def _turn_label(r) -> str:
+        return f"{r.label} · {r.angle_deg:+.1f}° · {r.t1 - r.t0:.1f} s"
+
+    cA, cB, cC = st.columns([2, 2, 1.3])
+    picks = []
+    for col, tag, default_idx in ((cA, "A", 0), (cB, "B", min(1, len(rec_names) - 1))):
+        with col:
+            rec = st.selectbox(
+                f"Recording {tag}", rec_names, index=default_idx, format_func=_recording_label, key=f"tc_rec_{tag}"
+            )
+            kin_x, res_x, rots_x = _turn_data(rec)
+            if not rots_x:
+                st.info("No turntable rotation detected in this recording.")
+                continue
+            same_as_a = tag == "B" and picks and picks[0][1] == rec
+            r_idx = st.selectbox(
+                f"Turn {tag}",
+                list(range(len(rots_x))),
+                index=1 if same_as_a and len(rots_x) > 1 else 0,
+                format_func=lambda i, rots_x=rots_x: _turn_label(rots_x[i]),
+                key=f"tc_turn_{tag}_{rec}",
+            )
+            picks.append((tag, rec, kin_x, res_x, rots_x[r_idx]))
+    with cC:
+        align = st.radio("Align at", ["Turn start", "Turn end"], key="tc_align")
+        tc_pad = st.number_input("Show before / after [s]", value=float(turn_s.pad_s), min_value=0.5, step=0.5)
+
+    if len(picks) == 2:
+        series, table_rows = [], []
+        for tag, rec, kin_x, res_x, r in picks:
+            ref = r.t0 if align == "Turn start" else r.t1
+            i0 = int(np.searchsorted(kin_x.t, r.t0 - tc_pad))
+            i1 = int(np.searchsorted(kin_x.t, r.t1 + tc_pad, side="right"))
+            sl_ = slice(i0, max(i1, i0 + 2))
+            sign_ = 1.0 if r.angle_deg >= 0 else -1.0
+            demand = friction_demand_g(res_x, kin_x)
+            limit = dynamic_limit_g(res_x, kin_x)
+            series.append(
+                {
+                    "label": f"{tag}: {rec} · {r.label}",
+                    "t": kin_x.t[sl_] - ref,
+                    "yaw_rate": np.abs(np.rad2deg(kin_x.wz[sl_])),
+                    "demand_g": demand[sl_],
+                    "limit_g": limit[sl_],
+                    "yaw_acc": sign_ * np.rad2deg(kin_x.alpha[sl_]),
+                }
+            )
+            tt_x = analyse_rotations(kin_x, res_x, [r], turn_s).iloc[0]
+            rot_m = (kin_x.t >= r.t0) & (kin_x.t <= r.t1)
+            around = (kin_x.t >= r.t0 - tc_pad) & (kin_x.t <= r.t1 + tc_pad)
+            table_rows.append(
+                {
+                    "": tag,
+                    "Recording": rec,
+                    "Turn": r.label,
+                    "Start clock": tt_x["Start clock"],
+                    "Angle [deg]": tt_x["Angle [deg]"],
+                    "Duration [s]": tt_x["Duration [s]"],
+                    "Peak rate [deg/s]": tt_x["Peak rate [deg/s]"],
+                    "Spin-up time [s]": tt_x["Spin-up time [s]"],
+                    "Braking time [s]": tt_x["Braking time [s]"],
+                    "Peak spin-up accel. [deg/s2]": tt_x["Peak spin-up accel. [deg/s2]"],
+                    "Peak braking decel. [deg/s2]": tt_x["Peak braking decel. [deg/s2]"],
+                    "Slow / creep phase [deg]": tt_x["Slow / creep phase [deg]"],
+                    "Max demand · rotation [g]": round(float(np.nanmax(demand[rot_m])), 3) if rot_m.any() else np.nan,
+                    "Max demand · window [g]": round(float(np.nanmax(demand[around])), 3) if around.any() else np.nan,
+                    "Lowest dynamic limit [g]": round(float(np.nanmin(limit[around])), 3) if around.any() else np.nan,
+                    "Required mu · entry": tt_x["Required mu · entry"],
+                    "Required mu · rotation": tt_x["Required mu · rotation"],
+                    "Required mu · exit": tt_x["Required mu · exit"],
+                    "Slip predicted": tt_x["Slip predicted"],
+                }
+            )
+        st.plotly_chart(fig_turn_compare(series), config=PLOT_CONFIG, key="turn_compare")
+        st.dataframe(pd.DataFrame(table_rows).set_index("").T, use_container_width=True)
+        st.caption(
+            "Friction demand = required μ × vertical acceleration (translation and turntable rotation), in g. "
+            "Dynamic limit = μs × vertical acceleration. Where a demand curve reaches its limit, that cluster slips."
+        )
 
 # --------------------------------------------------------------------------- #
 # Export

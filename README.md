@@ -12,7 +12,11 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 - Planar stick-slip model with a distributed Coulomb friction contact (full-area or four corner supports,
   optional non-uniform friction per corner region).
 - Turntable detection from the gyroscope: angle, fast / slow phases, spin-up and braking, friction demand at
-  entry, rotation and exit, and an estimate of the turntable axis position relative to the sensor.
+  entry, rotation and exit, and an estimate of the turntable axis position relative to the sensor. Friction demand
+  (required μ × vertical acceleration, including the rotational load) is shown right below the yaw rate against
+  the dynamic friction limit μs·f_z.
+- Turntable comparison: pick a turn in one recording and a turn in another (or the same) recording and overlay
+  yaw rate, friction demand vs. dynamic limit and yaw acceleration, aligned at the turn start or end.
 - Dynamic friction limit μs·f_z: the friction capacity drops whenever the carrier bumps (vertical acceleration < 1 g).
 - Speed profile of the whole route (travel speed, start / stop ramps, longitudinal acceleration vs. friction limit).
 - Travel direction of the carrier per motion segment (auto-detected, manually editable) and a motion phase for
