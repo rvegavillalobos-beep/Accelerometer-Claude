@@ -16,12 +16,15 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import contextmanager
+import dataclasses
 from dataclasses import asdict
 from pathlib import Path
 
 import importlib
 import os
+import pickle
 import sys
+import threading
 import time
 import uuid
 
@@ -35,8 +38,7 @@ import streamlit as st
 _LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "visuals")
 
 
-def _reload_stale_local_modules() -> None:
-    stale = False
+def _local_modules_stale() -> bool:
     for _name in _LOCAL_MODULES:
         _mod = sys.modules.get(_name)
         _file = getattr(_mod, "__file__", None) if _mod is not None else None
@@ -44,13 +46,22 @@ def _reload_stale_local_modules() -> None:
             continue
         try:
             if getattr(_mod, "_LOADED_MTIME", None) != os.path.getmtime(_file):
-                stale = True
+                return True
         except OSError:
             continue
-    if stale:
-        for _name in _LOCAL_MODULES:
-            if _name in sys.modules:
-                importlib.reload(sys.modules[_name])
+    return False
+
+
+def _reload_stale_local_modules() -> None:
+    if not _local_modules_stale():
+        return
+    # One process serves every open browser session: only one of them reloads, the others wait for it.
+    lock = sys.__dict__.setdefault("_got_slip_reload_lock", threading.Lock())
+    with lock:
+        if _local_modules_stale():
+            for _name in _LOCAL_MODULES:
+                if _name in sys.modules:
+                    importlib.reload(sys.modules[_name])
 
 
 _reload_stale_local_modules()
@@ -118,13 +129,15 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
 _CALC_MODULES = ("data_io.py", "slip_model.py", "turns.py", "motion.py")
+_CACHE_FORMAT = b"plain-records-v2"  # bump when the layout of cached values changes
 CACHE_V = hashlib.md5(
-    b"".join(Path(__file__).with_name(f).read_bytes() for f in _CALC_MODULES if Path(__file__).with_name(f).exists())
+    _CACHE_FORMAT
+    + b"".join(Path(__file__).with_name(f).read_bytes() for f in _CALC_MODULES if Path(__file__).with_name(f).exists())
 ).hexdigest()[:12]
 
 st.set_page_config(page_title="GOT Cluster Slip Simulator", page_icon="🔋", layout="wide")
@@ -135,39 +148,144 @@ st.set_page_config(page_title="GOT Cluster Slip Simulator", page_icon="🔋", la
 # --------------------------------------------------------------------------- #
 # Cache sizes are bounded and entries expire, so memory does not grow without limit on Streamlit Cloud
 # (a container that runs out of memory is restarted and every open browser loses its connection).
+#
+# st.cache_data pickles what it stores, and pickle refers to classes by module and name. After a redeploy the
+# app's own modules are loaded again, so a result built with the previous class object can no longer be
+# pickled ("it's not the same object as slip_model.ClusterParams"). Instances of the app's own classes are
+# therefore stored as plain records (module, class name, attribute values) and rebuilt with the classes that
+# are loaded when they are read. Arrays and tables are stored unchanged.
+_PLAIN_TAG = "__got_local_object__"
+
+
+def _to_plain(obj):
+    t = type(obj)
+    if t.__module__ in _LOCAL_MODULES and hasattr(obj, "__dict__"):
+        return {_PLAIN_TAG: (t.__module__, t.__qualname__), "state": {k: _to_plain(v) for k, v in vars(obj).items()}}
+    if t is list:
+        return [_to_plain(v) for v in obj]
+    if t is tuple:
+        return tuple(_to_plain(v) for v in obj)
+    if t is dict:
+        return {k: _to_plain(v) for k, v in obj.items()}
+    return obj
+
+
+def _from_plain(obj):
+    t = type(obj)
+    if t is dict:
+        if _PLAIN_TAG in obj:
+            mod_name, qualname = obj[_PLAIN_TAG]
+            cls = getattr(sys.modules.get(mod_name) or importlib.import_module(mod_name), qualname)
+            inst = cls.__new__(cls)
+            state = {k: _from_plain(v) for k, v in obj["state"].items()}
+            for f in getattr(cls, "__dataclass_fields__", {}).values():  # fields added by a newer version
+                if f.name not in state:
+                    if f.default is not dataclasses.MISSING:
+                        state[f.name] = f.default
+                    elif f.default_factory is not dataclasses.MISSING:
+                        state[f.name] = f.default_factory()
+            for k, v in state.items():
+                object.__setattr__(inst, k, v)  # also works for frozen dataclasses
+            return inst
+        return {k: _from_plain(v) for k, v in obj.items()}
+    if t is list:
+        return [_from_plain(v) for v in obj]
+    if t is tuple:
+        return tuple(_from_plain(v) for v in obj)
+    return obj
+
+
+_CACHE_ERROR_NAMES = {
+    "CacheError",
+    "CacheKeyNotFoundError",
+    "UnserializableReturnValueError",
+    "UnhashableParamError",
+    "UnhashableTypeError",
+}
+
+
+def _is_cache_failure(exc: BaseException) -> bool:
+    e, depth = exc, 0
+    while e is not None and depth < 6:
+        if isinstance(e, (pickle.PicklingError, pickle.UnpicklingError)):
+            return True
+        if any(c.__name__ in _CACHE_ERROR_NAMES for c in type(e).__mro__):
+            return True
+        e, depth = e.__cause__ or e.__context__, depth + 1
+    return False
+
+
+def _cached_call(cached_fn, direct_fn, *args):
+    """Read through the cache; if the cache itself fails, compute directly so the page still works."""
+    try:
+        out = cached_fn(CACHE_V, *args)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_cache_failure(exc):
+            raise
+        out = direct_fn(*args)
+    return _from_plain(out)
+
+
+def _compute_raw(data: bytes, name: str):
+    return _to_plain(read_witmotion(data, name))
+
+
 @st.cache_data(show_spinner=False, max_entries=64, ttl=6 * 3600)
-def _load_raw_cached(cache_v: str, data: bytes, name: str) -> RawRecording:
-    return read_witmotion(data, name)
+def _load_raw_cached(cache_v: str, data: bytes, name: str):
+    return _compute_raw(data, name)
 
 
 def load_raw(data: bytes, name: str) -> RawRecording:
-    return _load_raw_cached(CACHE_V, data, name)
+    return _cached_call(_load_raw_cached, _compute_raw, data, name)
+
+
+def _compute_kinematics(data: bytes, name: str, pre: dict):
+    raw = load_raw(data, name)
+    return _to_plain(preprocess(raw, PreprocessSettings(**pre)))
 
 
 @st.cache_data(show_spinner=False, max_entries=16, ttl=2 * 3600)
 def _load_kinematics_cached(cache_v: str, data: bytes, name: str, pre: dict):
-    raw = load_raw(data, name)
-    return preprocess(raw, PreprocessSettings(**pre))
+    return _compute_kinematics(data, name, pre)
 
 
 def load_kinematics(data: bytes, name: str, pre: dict):
-    return _load_kinematics_cached(CACHE_V, data, name, pre)
+    return _cached_call(_load_kinematics_cached, _compute_kinematics, data, name, pre)
+
+
+def _compute_simulation(data, name, pre, cluster, contact, sensor, solver):
+    kin = load_kinematics(data, name, pre)
+    return _to_plain(
+        simulate(
+            kin, ClusterParams(**cluster), ContactParams(**contact), SensorGeometry(**sensor), SolverParams(**solver)
+        )
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=8, ttl=2 * 3600)
 def _run_simulation_cached(
     cache_v: str, data: bytes, name: str, pre: dict, cluster: dict, contact: dict, sensor: dict, solver: dict
-) -> SimulationResult:
-    kin = load_kinematics(data, name, pre)
-    return simulate(
-        kin, ClusterParams(**cluster), ContactParams(**contact), SensorGeometry(**sensor), SolverParams(**solver)
-    )
+):
+    return _compute_simulation(data, name, pre, cluster, contact, sensor, solver)
 
 
 def run_simulation(
     data: bytes, name: str, pre: dict, cluster: dict, contact: dict, sensor: dict, solver: dict
 ) -> SimulationResult:
-    return _run_simulation_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver)
+    return _cached_call(_run_simulation_cached, _compute_simulation, data, name, pre, cluster, contact, sensor, solver)
+
+
+def _compute_sweep(data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio) -> pd.DataFrame:
+    kin = load_kinematics(data, name, pre)
+    return friction_sweep(
+        kin,
+        ClusterParams(**cluster),
+        ContactParams(**contact),
+        SensorGeometry(**sensor),
+        list(mus),
+        SolverParams(**solver),
+        keep_ratio=keep_ratio,
+    )
 
 
 @st.cache_data(show_spinner=False, max_entries=8, ttl=2 * 3600)
@@ -183,20 +301,13 @@ def _run_sweep_cached(
     mus: tuple,
     keep_ratio: bool,
 ) -> pd.DataFrame:
-    kin = load_kinematics(data, name, pre)
-    return friction_sweep(
-        kin,
-        ClusterParams(**cluster),
-        ContactParams(**contact),
-        SensorGeometry(**sensor),
-        list(mus),
-        SolverParams(**solver),
-        keep_ratio=keep_ratio,
-    )
+    return _compute_sweep(data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio)
 
 
 def run_sweep(data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio) -> pd.DataFrame:
-    return _run_sweep_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio)
+    return _cached_call(
+        _run_sweep_cached, _compute_sweep, data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio
+    )
 
 
 @contextmanager
@@ -214,19 +325,7 @@ def fmt_clock(ts) -> str:
     return pd.Timestamp(ts).strftime("%H:%M:%S.%f")[:-3]
 
 
-@st.cache_data(show_spinner=False, max_entries=400, ttl=6 * 3600)
-def _compare_row_cached(
-    cache_v: str,
-    data: bytes,
-    name: str,
-    pre: dict,
-    cluster: dict,
-    contact: dict,
-    sensor: dict,
-    solver: dict,
-    turn_d: dict,
-    mu_s: float,
-) -> tuple[dict, pd.DataFrame]:
+def _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s) -> tuple[dict, pd.DataFrame]:
     """Summary of one recording for the comparison tab. Only the small summary is cached (a few kB), not the
     full simulation, so many recordings can be compared without filling the memory or recomputing on every click."""
     kin_i = preprocess(load_raw(data, name), PreprocessSettings(**pre))
@@ -257,8 +356,26 @@ def _compare_row_cached(
     return row, pk_i
 
 
+@st.cache_data(show_spinner=False, max_entries=400, ttl=6 * 3600)
+def _compare_row_cached(
+    cache_v: str,
+    data: bytes,
+    name: str,
+    pre: dict,
+    cluster: dict,
+    contact: dict,
+    sensor: dict,
+    solver: dict,
+    turn_d: dict,
+    mu_s: float,
+) -> tuple[dict, pd.DataFrame]:
+    return _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s)
+
+
 def compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s) -> tuple[dict, pd.DataFrame]:
-    return _compare_row_cached(CACHE_V, data, name, pre, cluster, contact, sensor, solver, turn_d, float(mu_s))
+    return _cached_call(
+        _compare_row_cached, _compute_compare_row, data, name, pre, cluster, contact, sensor, solver, turn_d, float(mu_s)
+    )
 
 
 # --------------------------------------------------------------------------- #
