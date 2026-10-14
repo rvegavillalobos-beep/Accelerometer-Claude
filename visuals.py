@@ -1213,6 +1213,7 @@ def fig_line_map(
     sections: list[dict],
     stations: pd.DataFrame,
     mu_s: float,
+    arrows: list[tuple[float, float, float, float]] | None = None,
 ) -> go.Figure:
     """Plant layout with the conveyor path; every measured section drawn along the conveyors, red where μs was
     exceeded (badge = number of exceedances), blue otherwise. Loops are drawn as the loop, single stations as a ring.
@@ -1291,6 +1292,25 @@ def fig_line_map(
         )
         badges.append([mx, my, sec["n_exc"], hover])
 
+    if arrows:
+        # flow direction on top of the sections (x, y, dx, dy in image pixels); marker angle is clockwise from north in plot coordinates
+        fig.add_trace(
+            go.Scatter(
+                x=[a[0] for a in arrows],
+                y=[H - a[1] for a in arrows],
+                mode="markers",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=9,
+                    color=INK_2,
+                    angle=[float(np.degrees(np.arctan2(a[2], -a[3]))) for a in arrows],
+                    line=dict(color="white", width=1),
+                ),
+                opacity=0.9,
+                name="Flow direction",
+                hoverinfo="skip",
+            )
+        )
     # keep badges from covering each other
     r = 0.022 * max(W, H)
     for i in range(len(badges)):

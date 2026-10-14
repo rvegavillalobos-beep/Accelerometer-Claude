@@ -29,8 +29,9 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings
   (highest required μ per recording, plus every distinct exceedance of μs marked at its peak and counted).
 - Line layout map (Compare tab): the plant layout, the conveyor path and the station positions are embedded in the
-  app. Every recording is drawn along the conveyors between the stations in its file name (`St430-440`, `St989`,
-  `St540 deindex`, `St540Loop540`, `St981-Buffer`), red where μs is exceeded with the number of exceedances.
+  app. Every recording is drawn along the conveyors, in the flow direction (ST 130 → buffer), between the stations in
+  its file name (`St430-440`, `St989`, `St540 deindex`, `St540Loop540`, `St981-Buffer`), red where μs is exceeded
+  with the number of exceedances.
 - CSV / JSON export of all results.
 - Uploaded files survive a page reload: they are kept in server memory (max. 12 h) under a random id in the page
   URL (`?ws=...`), so reloading after a lost connection restores them.
@@ -79,7 +80,8 @@ The sensor orientation and position on the workpiece carrier are set in the side
 The map is generated from `assets/source/line_layout_paths.png`: the layout with the conveyor path drawn in red,
 white boxes with a red frame for station names that are hidden on the drawing (e.g. `ST395`), and the light
 grey-blue box with the word *buffer*. Station label positions are listed in `STATION_LABELS` in
-`tools/build_line_layout.py`. After changing either, run (Tesseract is needed to read the boxes):
+`tools/build_line_layout.py`, the flow direction in `FLOW_START`, `FLOW_END` and `RECIRCULATION` (loops that run
+back upstream, such as the loop through ST 540). After changing either, run (Tesseract is needed to read the boxes):
 
 ```bash
 pip install opencv-python-headless scikit-image scipy numpy pillow

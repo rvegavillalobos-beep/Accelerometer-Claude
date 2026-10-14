@@ -107,18 +107,24 @@ def known_stations() -> list[str]:
 # --------------------------------------------------------------------------- #
 # Conveyor graph
 # --------------------------------------------------------------------------- #
-@lru_cache(maxsize=1)
-def _adjacency() -> dict[int, list[tuple[int, float, int]]]:
+@lru_cache(maxsize=2)
+def _adjacency(directed: bool = True) -> dict[int, list[tuple[int, float, int]]]:
+    """Outgoing conveyor edges per node. Directed: only in the flow direction (ST 130 -> buffer)."""
     adj: dict[int, list[tuple[int, float, int]]] = {i: [] for i in range(len(_D.NODES))}
-    for k, (a, b, length, _pts) in enumerate(_D.EDGES):
-        if a != b:
+    for k, (a, b, length, direction, _pts) in enumerate(_D.EDGES):
+        if a == b:
+            continue
+        if direction >= 0 or not directed:
             adj[a].append((b, length, k))
+        if direction <= 0 or not directed:
             adj[b].append((a, length, k))
     return adj
 
 
-def _shortest(src: int, dst: int, banned_edge: int | None = None) -> tuple[float, list[tuple[int, int, int]]] | None:
-    adj = _adjacency()
+def _shortest(
+    src: int, dst: int, banned_edge: int | None = None, directed: bool = True
+) -> tuple[float, list[tuple[int, int, int]]] | None:
+    adj = _adjacency(directed)
     dist, prev, heap = {src: 0.0}, {}, [(0.0, src)]
     while heap:
         d, u = heapq.heappop(heap)
@@ -146,7 +152,7 @@ def _shortest(src: int, dst: int, banned_edge: int | None = None) -> tuple[float
 def _polyline(seq: list[tuple[int, int, int]]) -> list[tuple[float, float]]:
     pts: list[tuple[float, float]] = []
     for u, _v, k in seq:
-        a, _b, _len, e_pts = _D.EDGES[k]
+        a, _b, _len, _dir, e_pts = _D.EDGES[k]
         part = list(e_pts) if a == u else list(reversed(e_pts))
         pts.extend(part if not pts else part[1:])
     return [(float(x), float(y)) for x, y in pts]
@@ -160,40 +166,57 @@ def node_xy(key: str) -> tuple[float, float] | None:
     return float(x), float(y)
 
 
-def route(keys: list[str]) -> tuple[list[tuple[float, float]], float] | None:
-    """Shortest way along the conveyors through the given stations, in order."""
+def _leg(a: int, b: int) -> tuple[list[tuple[float, float]], float, str] | None:
+    """Way from node a to node b: in the flow direction; if the name is written against the flow, the same stretch
+    in the flow direction (b -> a, drawn from a to b); as a last resort ignoring the direction."""
+    res = _shortest(a, b)
+    if res is not None:
+        return _polyline(res[1]), res[0], "flow"
+    res = _shortest(b, a)
+    if res is not None:
+        return list(reversed(_polyline(res[1]))), res[0], "against_flow"
+    res = _shortest(a, b, directed=False)
+    if res is not None:
+        return _polyline(res[1]), res[0], "undirected"
+    return None
+
+
+def route(keys: list[str]) -> tuple[list[tuple[float, float]], float, str] | None:
+    """Way along the conveyors through the given stations, in order (shortest way in the flow direction)."""
     nodes = [_D.STATIONS[k][1] for k in keys]
     pts: list[tuple[float, float]] = []
-    total = 0.0
+    total, how = 0.0, "flow"
     for a, b in zip(nodes[:-1], nodes[1:]):
         if a == b:
             continue
-        res = _shortest(a, b)
-        if res is None:
+        leg = _leg(a, b)
+        if leg is None:
             return None
-        d, seq = res
-        part = _polyline(seq)
+        part, d, h = leg
         pts.extend(part if not pts else part[1:])
         total += d
+        if h != "flow":
+            how = h
     if not pts:
-        pts = [_D.NODES[nodes[0]]]
-    return pts, total
+        pts = [tuple(_D.NODES[nodes[0]])]
+    return pts, total, how
 
 
 def loop(key: str) -> tuple[list[tuple[float, float]], float] | None:
-    """Smallest conveyor loop that passes through a station."""
+    """Smallest conveyor loop through a station, in the flow direction (e.g. the loop through ST 540)."""
     s = _D.STATIONS[key][1]
-    best = None
-    for v, length, k in _adjacency()[s]:
-        res = _shortest(v, s, banned_edge=k)
-        if res is None:
-            continue
-        d, seq = res
-        if best is None or length + d < best[0]:
-            best = (length + d, [(s, v, k)] + seq)
-    if best is None:
-        return None
-    return _polyline(best[1]), best[0]
+    for directed in (True, False):
+        best = None
+        for v, length, k in _adjacency(directed)[s]:
+            res = _shortest(v, s, banned_edge=k, directed=directed)
+            if res is None:
+                continue
+            d, seq = res
+            if best is None or length + d < best[0]:
+                best = (length + d, [(s, v, k)] + seq)
+        if best is not None:
+            return _polyline(best[1]), best[0]
+    return None
 
 
 def section_geometry(row) -> dict:
@@ -214,7 +237,7 @@ def section_geometry(row) -> dict:
     r = route(keys)
     if r is None:
         return {"kind": "no_path", "keys": keys, "missing": [], "path": [], "length": 0.0}
-    return {"kind": "route", "keys": keys, "missing": [], "path": r[0], "length": r[1]}
+    return {"kind": "route", "keys": keys, "missing": [], "path": r[0], "length": r[1], "direction": r[2]}
 
 
 def section_label(row) -> str:
@@ -245,7 +268,27 @@ def background_uri() -> str:
 
 def network() -> list[list[tuple[float, float]]]:
     """Every conveyor segment of the layout as a polyline."""
-    return [[(float(x), float(y)) for x, y in pts] for _a, _b, _len, pts in _D.EDGES]
+    return [[(float(x), float(y)) for x, y in pts] for _a, _b, _len, _dir, pts in _D.EDGES]
+
+
+def flow_arrows(min_len: float = 45.0, spacing: float = 140.0) -> list[tuple[float, float, float, float]]:
+    """Arrow positions (x, y) and unit direction (dx, dy) along the directed conveyors, in image pixels."""
+    out = []
+    for _a, _b, length, direction, pts in _D.EDGES:
+        if not direction or length < min_len:
+            continue
+        p = [(float(x), float(y)) for x, y in (pts if direction > 0 else list(reversed(pts)))]
+        seg = [((x1 - x0), (y1 - y0), ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5) for (x0, y0), (x1, y1) in zip(p[:-1], p[1:])]
+        n = max(1, int(length // spacing))
+        for j in range(n):
+            target, run = (j + 0.5) * length / n, 0.0
+            for (x0, y0), (dx, dy, L) in zip(p[:-1], seg):
+                if L > 0 and run + L >= target:
+                    f = (target - run) / L
+                    out.append((x0 + f * dx, y0 + f * dy, dx / L, dy / L))
+                    break
+                run += L
+    return out
 
 
 def stations_table() -> pd.DataFrame:

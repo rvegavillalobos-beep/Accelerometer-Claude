@@ -99,6 +99,7 @@ from motion import (
     travel_arrays,
 )
 from line_layout import background_uri as layout_background_uri
+from line_layout import flow_arrows as layout_arrows
 from line_layout import image_size as layout_image_size
 from line_layout import known_stations, section_geometry, section_label, sections_table, station_display
 from line_layout import network as layout_network
@@ -1566,8 +1567,9 @@ def render_line_map(recordings: list[str], cmp_df: pd.DataFrame, peaks_map: dict
     st.caption(
         "Each recording is drawn along the conveyors between the stations in its file name: **St430-440** "
         "(from ST 430 to ST 440), **St989** or **St540 deindex** (one station; text after the number is a note), "
-        "**St540Loop540** (the conveyor loop through ST 540), **St981-Buffer** (to the buffer). Red = μs exceeded, "
-        "the badge is the number of exceedances. The map shows in which section, not where inside it."
+        "**St540Loop540** (the conveyor loop through ST 540), **St981-Buffer** (to the buffer). Routes follow the "
+        "flow direction (ST 130 → buffer, grey arrows). Red = μs exceeded, the badge is the number of exceedances. "
+        "The map shows in which section, not where inside it."
     )
     map_box = st.container()
     with st.expander("Sections from the file names", expanded=False):
@@ -1628,8 +1630,16 @@ def render_line_map(recordings: list[str], cmp_df: pd.DataFrame, peaks_map: dict
     with map_box:
         W, H = layout_image_size()
         st.plotly_chart(
-            fig_line_map(layout_background_uri(), W, H, layout_network(), [g for g in secs if g["path"]],
-                         layout_stations(), mu_s),
+            fig_line_map(
+                layout_background_uri(),
+                W,
+                H,
+                layout_network(),
+                [g for g in secs if g["path"]],
+                layout_stations(),
+                mu_s,
+                arrows=layout_arrows(),
+            ),
             config=PLOT_CONFIG,
             key="line_map",
         )
@@ -1966,11 +1976,13 @@ are flagged *Poor*.
 #### Line layout map (Compare tab)
 
 The plant layout, the conveyor path and the station positions are embedded in the app (generated once from the
-layout with the path drawn in red). Every recording is drawn as the shortest way along the conveyors between the
-stations in its file name (`St<from>-<to>`); `St<station>` is drawn as a ring at the station and a name with *Loop*
-(`St540Loop540`) as the smallest conveyor loop through the station. Where the carrier takes a longer way than the
-shortest one, the stations it passes can be added as *Via* in the sections table. The map tells in which section μs
-is exceeded and how often, not where inside the section.
+layout with the path drawn in red). The conveyors are directed: carriers flow from ST 130 to the buffer; side
+branches that leave and rejoin the main line run in the same direction, and the loop through ST 540 returns
+upstream (20 → 21 → ST 540 → 23 → 18). Every recording is drawn as the shortest way in the flow direction between
+the stations in its file name (`St<from>-<to>`; a name written against the flow is drawn on the same stretch);
+`St<station>` is drawn as a ring at the station and a name with *Loop* (`St540Loop540`) as the smallest loop through
+the station. Where the carrier takes another way, the stations it passes can be added as *Via* in the sections
+table. The map tells in which section μs is exceeded and how often, not where inside the section.
 
 #### Assumptions and limits
 
