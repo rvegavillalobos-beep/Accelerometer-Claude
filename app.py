@@ -35,7 +35,7 @@ import streamlit as st
 # Local modules in dependency order. After a git push, Streamlit Cloud can rerun the new app.py while older
 # versions of these modules are still loaded in the Python process (ImportError on new names). Every module
 # stores the mtime of its source file when it is loaded; if any file on disk is newer, all are reloaded.
-_LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "line_map", "visuals")
+_LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "visuals")
 
 
 def _local_modules_stale() -> bool:
@@ -98,21 +98,6 @@ from motion import (
     segments_table,
     travel_arrays,
 )
-from line_map import (
-    display_image_uri,
-    image_size,
-    ocr_available,
-    pack_layout_map,
-    read_layout_labels,
-    resolve_stations,
-    section_keys,
-    section_paths,
-    sections_table,
-    station_display,
-    station_key,
-    unpack_layout_map,
-    wanted_stations,
-)
 from turns import (
     TurnSettings,
     analyse_rotations,
@@ -129,9 +114,7 @@ from visuals import (
     friction_demand_g,
     fig_friction,
     fig_kinematics,
-    fig_line_map,
     fig_motion,
-    fig_station_picker,
     fig_sweep,
     dynamic_limit_g,
     fig_dynamic_limit,
@@ -150,7 +133,7 @@ APP_VERSION = "1.3.1"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
-_CALC_MODULES = ("data_io.py", "slip_model.py", "turns.py", "motion.py", "line_map.py")
+_CALC_MODULES = ("data_io.py", "slip_model.py", "turns.py", "motion.py")
 _CACHE_FORMAT = b"plain-records-v2"  # bump when the layout of cached values changes
 CACHE_V = hashlib.md5(
     _CACHE_FORMAT
@@ -325,25 +308,6 @@ def run_sweep(data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio
     return _cached_call(
         _run_sweep_cached, _compute_sweep, data, name, pre, cluster, contact, sensor, solver, mus, keep_ratio
     )
-
-
-def _compute_layout_labels(image: bytes, threshold: int) -> list[dict]:
-    return read_layout_labels(image, threshold)
-
-
-@st.cache_data(show_spinner=False, max_entries=8, ttl=12 * 3600)
-def _layout_labels_cached(cache_v: str, image: bytes, threshold: int) -> list[dict]:
-    return _compute_layout_labels(image, threshold)
-
-
-def layout_labels(image: bytes, threshold: int) -> list[dict]:
-    return _cached_call(_layout_labels_cached, _compute_layout_labels, image, int(threshold))
-
-
-@st.cache_data(show_spinner=False, max_entries=8, ttl=12 * 3600)
-def layout_display(image: bytes) -> tuple[str, int, int]:
-    W, H = image_size(image)
-    return display_image_uri(image), W, H
 
 
 @contextmanager
@@ -1586,307 +1550,6 @@ with tab_sens, tab_guard("Friction sensitivity"):
 # --------------------------------------------------------------------------- #
 # Compare recordings
 # --------------------------------------------------------------------------- #
-# --------------------------------------------------------------------------- #
-# Line layout map (Compare tab)
-# --------------------------------------------------------------------------- #
-_LM_EMPTY = {
-    "image": None,
-    "image_name": "",
-    "labels": [],
-    "manual": {},
-    "removed": [],
-    "sections": {},
-    "sections_effective": {},
-    "threshold": 90,
-    "ocr_done": False,
-    "upload_digest": None,
-}
-
-
-def _lm_state() -> dict:
-    """Layout map of this browser session; kept in server memory under the page id so a reload restores it."""
-    lm = st.session_state.get("lm_state")
-    if lm is None:
-        stored = _upload_store().get(f"{ws_id}:layout")
-        lm = dict(_LM_EMPTY)
-        if stored:
-            lm.update(stored["lm"])
-            lm["sections"] = dict(lm.get("sections_effective") or {})
-        st.session_state["lm_state"] = lm
-    return lm
-
-
-def _lm_keep(lm: dict) -> None:
-    if lm.get("image"):
-        _upload_store()[f"{ws_id}:layout"] = {"files": {"layout": lm["image"]}, "lm": dict(lm), "t": time.time()}
-
-
-def _selected_xy(event) -> tuple[float, float] | None:
-    """Clicked point (or centre of a dragged box) of st.plotly_chart(on_select=...), in plot coordinates."""
-    if event is None:
-        return None
-    try:
-        sel = event["selection"]
-    except (KeyError, TypeError):
-        sel = getattr(event, "selection", None)
-    if not sel:
-        return None
-    pts = [p for p in (sel.get("points") or []) if isinstance(p, dict) and p.get("x") is not None]
-    if pts:
-        return float(np.mean([p["x"] for p in pts])), float(np.mean([p["y"] for p in pts]))
-    for box in sel.get("box") or []:
-        if isinstance(box, dict) and box.get("x") is not None and box.get("y") is not None:
-            return float(np.mean(box["x"])), float(np.mean(box["y"]))
-    return None
-
-
-def render_line_map(recordings: list[str], cmp_df: pd.DataFrame, peaks_map: dict, mu_s: float) -> None:
-    st.divider()
-    st.markdown("##### Exceedances on the line layout")
-    st.caption(
-        "Upload the line layout once: station labels are read from the image and every recording is drawn as "
-        "the section its file name describes, red where μs is exceeded, with the number of exceedances. "
-        "File names: **St430-440** (section from ST 430 to ST 440), **St989** or **St540 deindex** (one "
-        "station, text after the number is a note), **St981-Buffer** (to a named place you add by hand). "
-        "Positions are approximate: the map shows *which section*, not where in the section."
-    )
-    lm = _lm_state()
-    map_box = st.container()
-
-    # ---- layout image and station positions ------------------------------------------------------------- #
-    with st.expander("Layout and station positions", expanded=not lm.get("image")):
-        up = st.file_uploader(
-            "Layout image (PNG / JPG) or a saved layout map (.json)",
-            type=["png", "jpg", "jpeg", "json"],
-            key="lm_upload",
-            help="The layout stays in this browser session and is not stored in the repository. Save the layout "
-            "map (.json) below to reuse it next time with every station already placed.",
-        )
-        if up is not None:
-            data = up.getvalue()
-            dig = hashlib.md5(data).hexdigest()
-            if dig != lm.get("upload_digest"):
-                lm["upload_digest"] = dig
-                if up.name.lower().endswith(".json"):
-                    try:
-                        loaded = unpack_layout_map(data)
-                        lm.update(loaded)
-                        lm["sections_effective"] = dict(loaded["sections"])
-                        lm["ocr_done"] = True
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"Could not read the layout map: {exc}")
-                else:
-                    lm.update(image=data, image_name=up.name, labels=[], manual={}, removed=[], ocr_done=False)
-                _lm_keep(lm)
-        if not lm.get("image"):
-            st.info("Upload the layout image of the line to draw the recordings on it.")
-            return
-        if not lm.get("ocr_done"):
-            if ocr_available():
-                with st.spinner("Reading the station labels on the layout (a few seconds)..."):
-                    lm["labels"] = layout_labels(lm["image"], lm.get("threshold", 90))
-            else:
-                st.warning(
-                    "Text recognition (Tesseract) is not installed on this server, so stations cannot be read "
-                    "from the image. Place them by hand below. On Streamlit Cloud it is installed from "
-                    "packages.txt — reboot the app once if this message appears after an update."
-                )
-            lm["ocr_done"] = True
-            _lm_keep(lm)
-
-    sections_default = sections_table(recordings)
-    for i, rec in enumerate(sections_default["Recording"]):
-        ov = (lm.get("sections") or {}).get(rec)
-        if ov:
-            for col in ("From", "To", "Via", "Note"):
-                if col in ov:
-                    sections_default.at[i, col] = ov[col] or ""
-    img_uri, W, H = layout_display(lm["image"])
-
-    # ---- sections from the file names ------------------------------------------------------------------- #
-    with st.expander("Sections from the file names", expanded=False):
-        st.caption(
-            "Read from the file names; correct them here if a name does not follow the convention. "
-            "**Via**: stations the conveyor passes in between, separated by commas (e.g. FT 001, FT 002), so the "
-            "section follows the line instead of a straight line."
-        )
-        ed_key = "lm_sections_" + hashlib.md5(sections_default.to_json().encode()).hexdigest()[:10]
-        sections = st.data_editor(sections_default, key=ed_key, hide_index=True, disabled=["Recording"])
-    sections = pd.DataFrame(sections).fillna("")
-    lm["sections_effective"] = {
-        r["Recording"]: {c: str(r[c]) for c in ("From", "To", "Via", "Note")} for _, r in sections.iterrows()
-    }
-    wanted = wanted_stations(sections)
-    stations = resolve_stations(lm.get("labels") or [], wanted, lm.get("manual") or {}, lm.get("removed") or [])
-    missing = [k for k in wanted if k not in set(stations["Key"])]
-
-    with st.expander("Place or move stations", expanded=bool(missing)):
-        found_n = int(((stations["Source"] == "Detected") & stations["Needed"]).sum())
-        hand_n = int(((stations["Source"] == "Placed by hand") & stations["Needed"]).sum())
-        st.markdown(
-            f"Stations in the file names: **{len(wanted)}** · read from the layout: **{found_n}** · "
-            f"placed by hand: **{hand_n}** · missing: **{len(missing)}**"
-            + (f" ({', '.join(station_display(k) for k in missing)})" if missing else "")
-        )
-        OTHER = "Other (type a name)..."
-        order = missing + [k for k in wanted if k not in missing]
-        c1, c2, c3 = st.columns([2, 2, 1])
-        pick = c1.selectbox(
-            "Station to place or move",
-            order + [OTHER],
-            format_func=lambda k: k if k == OTHER else station_display(k) + ("  (missing)" if k in missing else ""),
-            key="lm_target",
-        )
-        typed = c2.text_input("Name of the station or place", key="lm_typed", disabled=pick != OTHER)
-        target = station_key(typed) if pick == OTHER else pick
-        show_all = c3.toggle("All labels read", value=False, key="lm_show_all")
-        st.caption(
-            "Choose the station, then click its position on the layout (zoom in first with the mouse wheel or by "
-            "dragging a box if needed; double-click resets the zoom). Blue = read from the layout, green = placed "
-            "by hand, orange ring = current position of the selected station."
-        )
-        ev = st.plotly_chart(
-            fig_station_picker(img_uri, W, H, stations, target, show_all),
-            config=PLOT_CONFIG,
-            key="lm_picker",
-            on_select="rerun",
-            selection_mode=("points", "box"),
-        )
-        pt = _selected_xy(ev)
-        sig = None if pt is None else f"{pt[0]:.1f},{pt[1]:.1f}"
-        if sig != st.session_state.get("lm_last_pick"):
-            st.session_state["lm_last_pick"] = sig
-            if pt is not None and target:
-                name = typed.strip() if pick == OTHER and typed.strip() else station_display(target)
-                lm.setdefault("manual", {})[target] = {"name": name, "x": float(pt[0]), "y": float(H - pt[1])}
-                lm["removed"] = [k for k in (lm.get("removed") or []) if k != target]
-                _lm_keep(lm)
-                st.rerun()
-        r1, r2, r3 = st.columns([2, 1, 2])
-        if len(stations):
-            rm = r1.selectbox("Remove a station", list(stations["Key"]), format_func=station_display, key="lm_rm")
-            if r2.button("Remove", key="lm_rm_btn"):
-                lm.setdefault("manual", {}).pop(rm, None)
-                lm["removed"] = sorted(set(lm.get("removed") or []) | {rm})
-                _lm_keep(lm)
-                st.rerun()
-        with r3:
-            thr = st.number_input(
-                "Label darkness threshold",
-                min_value=40,
-                max_value=200,
-                value=int(lm.get("threshold", 90)),
-                step=10,
-                key="lm_thr",
-                help="Pixels darker than this are treated as label text. Raise it if labels are grey, lower it if "
-                "the drawing lines are dark. Placements made by hand are kept.",
-            )
-            if st.button("Read the labels again", key="lm_reread", disabled=not ocr_available()):
-                lm["threshold"] = int(thr)
-                with st.spinner("Reading the station labels on the layout..."):
-                    lm["labels"] = layout_labels(lm["image"], int(thr))
-                lm["removed"] = []
-                _lm_keep(lm)
-                st.rerun()
-        st.dataframe(
-            stations[stations["Needed"]][["Station", "Source", "Read as", "x", "y"]].round(0),
-            hide_index=True,
-        )
-        st.download_button(
-            "Save layout map (.json)",
-            pack_layout_map(lm),
-            file_name="line_layout_map.json",
-            mime="application/json",
-            help="Layout image, station positions and section table in one file. Upload it next time instead of "
-            "the image: no station has to be placed again.",
-        )
-    _lm_keep(lm)
-
-    # ---- map and section table ------------------------------------------------------------------------- #
-    row_of = {r["Recording"]: r for _, r in cmp_df.iterrows()}
-    groups: dict[tuple, dict] = {}
-    unmapped: list[tuple[str, list[str]]] = []
-    for p in section_paths(sections, stations):
-        rec = p["Recording"]
-        pk = peaks_map.get(rec)
-        n = 0 if pk is None else len(pk)
-        times = [] if pk is None or not len(pk) else [str(c) for c in pk["Clock"].tolist()]
-        mu_max = float(row_of[rec]["Required μ (no slip)"]) if rec in row_of else float("nan")
-        if p["missing"] or not p["path"]:
-            unmapped.append((rec, p["missing"]))
-        g = groups.setdefault(
-            p["section"] if p["keys"] else ("recording", rec),
-            {
-                "label": p["label"] if len(p["keys"]) else rec,
-                "path": p["path"],
-                "keys": p["keys"],
-                "single": p["single"],
-                "missing": p["missing"],
-                "n_exc": 0,
-                "mu_max": float("nan"),
-                "recordings": [],
-                "n_per_rec": [],
-                "times": [],
-            },
-        )
-        g["n_exc"] += n
-        g["mu_max"] = float(np.nanmax([g["mu_max"], mu_max])) if np.isfinite(mu_max) else g["mu_max"]
-        g["recordings"].append(rec)
-        g["n_per_rec"].append(n)
-        g["times"].append(times)
-        if len(g["recordings"]) > 1:
-            notes = {(lm["sections_effective"].get(r) or {}).get("Note", "") for r in g["recordings"]}
-            if len(notes) > 1:
-                g["label"] = station_display(p["keys"][0]) + (
-                    f" → {station_display(p['keys'][-1])}" if not p["single"] else ""
-                )
-    secs = list(groups.values())
-    with map_box:
-        st.plotly_chart(fig_line_map(img_uri, W, H, stations, secs, mu_s), config=PLOT_CONFIG, key="lm_map")
-        if unmapped:
-            miss = sorted({k for _r, ks in unmapped for k in ks})
-            unnamed = [r for r, ks in unmapped if not ks]
-            msg = []
-            if miss:
-                msg.append(
-                    f"no position yet for {', '.join(station_display(k) for k in miss)} — place them under "
-                    "**Place or move stations** below"
-                )
-            if unnamed:
-                msg.append(
-                    f"no station in the file name of {', '.join(unnamed)} — set From / To under **Sections from the "
-                    "file names** below"
-                )
-            st.warning(f"{len(unmapped)} recording(s) not on the map yet: " + "; ".join(msg) + ".")
-        n_bad = sum(1 for g in secs if g["n_exc"] > 0 and g["path"])
-        st.caption(
-            f"{n_bad} of {sum(1 for g in secs if g['path'])} sections on the map exceed μs = {mu_s:.3f}. Red = μs "
-            "exceeded (the badge is the number of exceedances, the line gets thicker with more), blue = measured "
-            "without exceedance; a circle is a recording at one station. Hover a badge for the recordings and "
-            "times. The camera icon saves the map as an image."
-        )
-        tab = pd.DataFrame(
-            [
-                {
-                    "Section": g["label"],
-                    "Recordings": ", ".join(g["recordings"]),
-                    "Exceedances of μs": g["n_exc"],
-                    "Highest required μ": round(g["mu_max"], 3) if np.isfinite(g["mu_max"]) else None,
-                    "Exceedance times": ", ".join(t for ts in g["times"] for t in ts),
-                    "On the map": "Yes"
-                    if g["path"]
-                    else (
-                        "No — place " + ", ".join(station_display(k) for k in g["missing"])
-                        if g["missing"]
-                        else "No — no station in the file name"
-                    ),
-                }
-                for g in sorted(secs, key=lambda g: -g["n_exc"])
-            ]
-        )
-        st.dataframe(tab, hide_index=True)
-
-
 with tab_cmp, tab_guard("Compare recordings"):
     if len(valid) < 2:
         st.info("Upload two or more recordings to compare them (e.g. before / after a conveyor adjustment).")
@@ -1921,7 +1584,6 @@ with tab_cmp, tab_guard("Compare recordings"):
             st.download_button(
                 "Download comparison (CSV)", cmp_df.to_csv(index=False).encode(), "comparison.csv", "text/csv"
             )
-            render_line_map(list(cmp_df["Recording"]), cmp_df, peaks_map, mu_s)
 
     # ------------------------------------------------------------------ #
     # Compare turntable rotations between recordings
@@ -2180,16 +1842,6 @@ offset is removed so that the speed returns to zero at the stop (zero-velocity u
 offset that MEMS accelerometers show under vibration and slight conveyor slopes. Segments longer than about a
 minute without a stop accumulate error and are flagged *Fair*; segments where the speed turns clearly negative
 are flagged *Poor*.
-
-#### Line layout map (Compare tab)
-
-Station labels are read from the layout image with Tesseract OCR. Only the darkest pixels are kept (labels are black
-text, the drawing is grey), every label is cut out, enlarged and read on its own in a few variants, and vertical
-labels are read turned both ways. Only exact readings are used: a label partly covered by an equipment number is not
-guessed from a similar number (that number is often another real station); it is reported as missing and placed by
-hand with one click. Every recording is drawn as the section its file name describes (`St<from>-<to>`,
-`St<station>`), as a straight line between the two stations or through the *Via* stations. The map tells in which
-section μs is exceeded and how often, not where inside the section.
 
 #### Assumptions and limits
 
