@@ -35,7 +35,16 @@ import streamlit as st
 # Local modules in dependency order. After a git push, Streamlit Cloud can rerun the new app.py while older
 # versions of these modules are still loaded in the Python process (ImportError on new names). Every module
 # stores the mtime of its source file when it is loaded; if any file on disk is newer, all are reloaded.
-_LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "line_layout_data", "line_layout", "visuals")
+_LOCAL_MODULES = (
+    "data_io",
+    "slip_model",
+    "turns",
+    "motion",
+    "line_layout_data",
+    "line_layout",
+    "whole_route",
+    "visuals",
+)
 
 
 def _local_modules_stale() -> bool:
@@ -99,9 +108,11 @@ from motion import (
 from line_layout import background_uri as layout_background_uri
 from line_layout import flow_arrows as layout_arrows
 from line_layout import image_size as layout_image_size
-from line_layout import known_stations, section_geometry, section_label, sections_table, station_display
+from line_layout import known_stations, route_order, section_geometry, section_keys, section_label, sections_table
+from line_layout import station_display
 from line_layout import network as layout_network
 from line_layout import stations_table as layout_stations
+from whole_route import accumulate, effective_mu, totals
 from turns import (
     TurnSettings,
     analyse_rotations,
@@ -119,6 +130,8 @@ from visuals import (
     fig_friction,
     fig_kinematics,
     fig_line_map,
+    fig_route_progress,
+    fig_route_sweep,
     fig_motion,
     fig_sweep,
     dynamic_limit_g,
@@ -330,15 +343,23 @@ def fmt_clock(ts) -> str:
     return pd.Timestamp(ts).strftime("%H:%M:%S.%f")[:-3]
 
 
-def _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s) -> tuple[dict, pd.DataFrame]:
-    """Summary of one recording for the comparison tab. Only the small summary is cached (a few kB), not the
-    full simulation, so many recordings can be compared without filling the memory or recomputing on every click."""
+def _corners_rel_com(cluster: dict, res_i) -> list:
+    """Corner positions relative to the cluster CoM [m] (to add up shifts over several recordings)."""
+    return (ClusterParams(**cluster).corners() - np.asarray(res_i.patch.com, dtype=float)).tolist()
+
+
+def _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s):
+    """Summary of one recording for the Compare, Line map and whole-route views. Only small results are cached (a few
+    kB), not the full simulation, so many recordings can be handled without filling the memory or recomputing on
+    every click. Returns (row, exceedance peaks, extra) with extra = final shift, slip events and corner geometry."""
     kin_i = preprocess(load_raw(data, name), PreprocessSettings(**pre))
     res_i = simulate(
         kin_i, ClusterParams(**cluster), ContactParams(**contact), SensorGeometry(**sensor), SolverParams(**solver)
     )
     s_i = summary(res_i, kin_i)
-    n_turn_i = sum(r.kind == "Turntable" for r in detect_rotations(kin_i, TurnSettings(**turn_d)))
+    turn_s_i = TurnSettings(**turn_d)
+    rots_i = detect_rotations(kin_i, turn_s_i)
+    n_turn_i = sum(r.kind == "Turntable" for r in rots_i)
     pk_i = exceedance_peaks(res_i, kin_i, mu_s)
     row = {
         "Recording": name,
@@ -358,7 +379,26 @@ def _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn
         "Peak yaw accel. [deg/s2]": round(s_i["peak_yaw_acc_deg_s2"], 1),
         "Turntable rotations": n_turn_i,
     }
-    return row, pk_i
+    events = res_i.events.copy()
+    if len(events):
+        events.insert(
+            events.columns.get_loc("Carrier motion") + 1,
+            "Conveyor context",
+            [locate(t_, rots_i, turn_s_i.pad_s) for t_ in events["Start [s]"]],
+        )
+        events = events.drop(columns=["Carrier motion"])
+    extra = {
+        "dx_mm": s_i["final_dx_mm"],
+        "dy_mm": s_i["final_dy_mm"],
+        "rot_deg": s_i["final_rot_deg"],
+        "corner_mm": s_i["final_corner_mm"],
+        "n_events": int(s_i["n_events"]),
+        "slip_time_s": float(s_i["slip_time_s"]),
+        "mu_noslip": float(s_i["mu_noslip"]),
+        "rel": _corners_rel_com(cluster, res_i),
+        "events": events,
+    }
+    return row, pk_i, extra
 
 
 @st.cache_data(show_spinner=False, max_entries=400, ttl=6 * 3600)
@@ -373,14 +413,48 @@ def _compare_row_cached(
     solver: dict,
     turn_d: dict,
     mu_s: float,
-) -> tuple[dict, pd.DataFrame]:
+):
     return _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s)
 
 
-def compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s) -> tuple[dict, pd.DataFrame]:
+def compare_row(data, name, pre, cluster, contact, sensor, solver, turn_d, mu_s) -> tuple[dict, pd.DataFrame, dict]:
     return _cached_call(
         _compare_row_cached, _compute_compare_row, data, name, pre, cluster, contact, sensor, solver, turn_d, float(mu_s)
     )
+
+
+def _compute_route_point(data, name, pre, cluster, contact, sensor, solver) -> dict:
+    """Final shift of one recording for one friction setting (whole-route friction sensitivity)."""
+    kin_i = preprocess(load_raw(data, name), PreprocessSettings(**pre))
+    res_i = simulate(
+        kin_i,
+        ClusterParams(**cluster),
+        ContactParams(**contact),
+        SensorGeometry(**sensor),
+        SolverParams(**solver),
+        max_slip_seconds=120.0,
+    )
+    s_i = summary(res_i, kin_i)
+    return {
+        "dx_mm": s_i["final_dx_mm"],
+        "dy_mm": s_i["final_dy_mm"],
+        "rot_deg": s_i["final_rot_deg"],
+        "corner_mm": s_i["final_corner_mm"],
+        "n_events": int(s_i["n_events"]),
+        "slip_time_s": float(s_i["slip_time_s"]),
+        "mu_noslip": float(s_i["mu_noslip"]),
+        "truncated": bool(res_i.truncated),
+        "rel": _corners_rel_com(cluster, res_i),
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=4000, ttl=6 * 3600)
+def _route_point_cached(cache_v, data, name, pre, cluster, contact, sensor, solver) -> dict:
+    return _compute_route_point(data, name, pre, cluster, contact, sensor, solver)
+
+
+def route_point(data, name, pre, cluster, contact, sensor, solver) -> dict:
+    return _cached_call(_route_point_cached, _compute_route_point, data, name, pre, cluster, contact, sensor, solver)
 
 
 # --------------------------------------------------------------------------- #
@@ -1060,19 +1134,294 @@ tabs = st.tabs(
 tab_over, tab_meas, tab_turn, tab_speed, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab_map, tab_meth = tabs
 
 
-def all_recording_rows() -> tuple[list[dict], dict[str, pd.DataFrame], list[str]]:
-    """Summary and exceedances of μs of every uploaded recording, simulated over its full length (cached)."""
-    rows, peaks, errors = [], {}, []
+def all_recording_rows() -> tuple[list[dict], dict[str, pd.DataFrame], list[str], dict[str, dict]]:
+    """Summary, exceedances of μs and final shift of every uploaded recording, simulated over its full length
+    (cached: the Compare, Line map, Slip events and Friction sensitivity tabs share the same results)."""
+    rows, peaks, errors, extras = [], {}, [], {}
     pre_full = dict(pre, t_start=None, t_end=None)
     for name, d in valid.items():
         try:
-            row_i, pk_i = compare_row(d, name, pre_full, cluster_d, contact_d, sensor_d, solver_d, asdict(turn_s), mu_s)
+            row_i, pk_i, ex_i = compare_row(
+                d, name, pre_full, cluster_d, contact_d, sensor_d, solver_d, asdict(turn_s), mu_s
+            )
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")
             continue
         peaks[name] = pk_i
         rows.append(row_i)
-    return rows, peaks, errors
+        extras[name] = ex_i
+    return rows, peaks, errors, extras
+
+
+# --------------------------------------------------------------------------- #
+# Whole route: all recordings in line order, as if one part had travelled them
+# --------------------------------------------------------------------------- #
+SCOPE_ACTIVE = "Active recording"
+SCOPE_ROUTE = "All uploaded recordings (whole route)"
+_SHIFT_KEYS = ("dx_mm", "dy_mm", "rot_deg", "corner_mm", "n_events", "slip_time_s")
+
+
+def effective_sections(recordings: list[str]) -> pd.DataFrame:
+    """Sections from the file names, with the corrections made in the Line map tab."""
+    base = sections_table(recordings)
+    key = "line_sections_" + hashlib.md5(base.to_json().encode()).hexdigest()[:10]
+    state = st.session_state.get(key)
+    edits = state.get("edited_rows") if isinstance(state, dict) else None
+    for i, changes in (edits or {}).items():
+        for col, val in (changes or {}).items():
+            if col in base.columns and col != "Recording" and int(i) < len(base):
+                base.at[int(i), col] = val
+    return base.fillna("")
+
+
+def route_rows(recordings: list[str]) -> list[tuple[str, pd.Series]]:
+    """(recording, section row) in line order (ST 130 -> buffer); names without a known station come last."""
+    sec = effective_sections(recordings)
+    return [(r["Recording"], r) for r in sorted((r for _, r in sec.iterrows()), key=route_order)]
+
+
+def route_exclusion_picker(where: str, names: list[str]) -> list[str]:
+    """Recordings left out of the whole route; one choice shared by the Slip events and Friction sensitivity tabs."""
+    key = f"route_out_{where}"
+    st.session_state[key] = [n for n in st.session_state.get("route_out", []) if n in names]
+
+    def _sync():
+        st.session_state["route_out"] = list(st.session_state.get(key, []))
+
+    return st.multiselect(
+        "Leave out of the whole route",
+        names,
+        key=key,
+        on_change=_sync,
+        help="E.g. a repeated measurement of the same section, or a test. The choice applies to the Slip events and "
+        "Friction sensitivity tabs.",
+    )
+
+
+def route_duplicates(incl: list[tuple[str, pd.Series]]) -> list[str]:
+    groups: dict[tuple, list[str]] = {}
+    for name, row in incl:
+        a, b, via = section_keys(row)
+        if not a:
+            continue
+        if b is None and not via:  # process inside a station: same station and same kind of process
+            words = str(row.get("Note") or "").strip().lower().split()
+            key = ("process", a, words[0] if words else "")
+        else:
+            key = ("transport", a, b, tuple(via))
+        groups.setdefault(key, []).append(name)
+    return [", ".join(v) for v in groups.values() if len(v) > 1]
+
+
+def route_parts(incl: list[tuple[str, pd.Series]], values: dict[str, dict]) -> list[dict]:
+    return [
+        dict(name=n, label=section_label(r), **{k: values[n][k] for k in _SHIFT_KEYS}) for n, r in incl if n in values
+    ]
+
+
+def route_selection(where: str):
+    """All recordings simulated (cached), put in line order; returns (included, extras) or None."""
+    with st.spinner("Simulating all recordings..."):
+        rows_r, _pk, errs, extras = all_recording_rows()
+    for msg in errs:
+        st.warning(msg)
+    if not extras:
+        st.info("None of the uploaded recordings could be simulated.")
+        return None
+    ordered = route_rows([r["Recording"] for r in rows_r])
+    out = route_exclusion_picker(where, [n for n, _ in ordered])
+    incl = [(n, r) for n, r in ordered if n not in out]
+    if not incl:
+        st.info("Every recording is left out.")
+        return None
+    for d in route_duplicates(incl):
+        st.warning(
+            f"Same section measured more than once: {d}. If these are repeated measurements, leave all but one out "
+            "above, otherwise their shift is added up twice."
+        )
+    unknown = [n for n, r in incl if not section_keys(r)[0]]
+    if unknown:
+        st.caption(
+            "Not placed on the line (no station in the file name), added at the end: " + ", ".join(unknown) + "."
+        )
+    return incl, extras
+
+
+def render_route_slip_events() -> None:
+    st.caption(
+        "Every uploaded recording is simulated over its full length with the current settings and put in line order "
+        "(ST 130 → buffer, from the file names), as if one part had travelled all the measured segments. The shifts "
+        "of the segments add up; shifts in opposite directions cancel. Compare the shift at the end with what you "
+        "measure on the part."
+    )
+    sel = route_selection("ev")
+    if sel is None:
+        return
+    incl, extras = sel
+    parts = route_parts(incl, extras)
+    rel = extras[incl[0][0]]["rel"]
+    prog = accumulate(parts, rel)
+    tot = totals(parts, rel)
+    c = st.columns(5)
+    c[0].metric("Recordings", len(incl))
+    c[1].metric("Slip events", tot["n_events"])
+    c[2].metric("Slip time", f"{tot['slip_time_s']:.1f} s")
+    c[3].metric(
+        "Corner shift at the end",
+        f"{tot['corner_mm']:.2f} mm",
+        help=f"If every segment had shifted the cluster the same way: {tot['sum_segment_corner_mm']:.2f} mm.",
+    )
+    c[4].metric("Rotation at the end", f"{tot['rot_deg']:.3f}°")
+    st.plotly_chart(fig_route_progress(prog, tol_mm, mu_s), config=PLOT_CONFIG, key="route_progress")
+    st.caption(
+        "Bars: shift caused by each segment on its own (red = it slips). Line: shift of the cluster accumulated "
+        "from the start of the line up to that segment."
+    )
+    st.markdown("##### Slip events of all recordings")
+    frames = []
+    for n, r in incl:
+        e = extras[n].get("events")
+        if e is None or not len(e):
+            continue
+        e = e.copy()
+        e.insert(0, "Section", section_label(r))
+        e.insert(0, "Recording", n)
+        frames.append(e)
+    if frames:
+        allev = pd.concat(frames, ignore_index=True)
+        cols = [
+            c_
+            for c_ in [
+                "Recording",
+                "Section",
+                "Event",
+                "Start clock",
+                "Duration [s]",
+                "Conveyor context",
+                "Driver",
+                "Peak mu required",
+                "dX [mm]",
+                "dY [mm]",
+                "dRotation [deg]",
+                "Max corner shift [mm]",
+                "Pivot",
+            ]
+            if c_ in allev.columns
+        ]
+        st.dataframe(allev[cols], hide_index=True)
+        st.download_button(
+            "Download slip events of all recordings (CSV)",
+            allev[cols].to_csv(index=False).encode(),
+            "slip_events_whole_route.csv",
+            "text/csv",
+        )
+    else:
+        st.info(f"No slip predicted on any of the recordings with μs = {mu_s:.3f}.")
+    with st.expander("Shift per recording"):
+        st.dataframe(prog, hide_index=True)
+
+
+def render_route_sweep(mu_lo: float, mu_hi: float, n_mu: int, keep_ratio: bool) -> None:
+    sel = route_selection("fs")
+    if sel is None:
+        return
+    incl, extras = sel
+    names = [n for n, _ in incl]
+    c1, c2 = st.columns(2)
+    meas_c = c1.number_input(
+        "Measured at the end: max corner shift [mm]",
+        value=0.0,
+        min_value=0.0,
+        step=0.1,
+        format="%.2f",
+        key="route_meas_corner",
+        help="Shift of the cluster on the GOT measured on the part at the end of the line (0 = not measured). "
+        "The μs at which the model predicts the same shift is the effective friction of the line.",
+    )
+    meas_r = c2.number_input(
+        "Measured at the end: rotation [deg]",
+        value=0.0,
+        min_value=0.0,
+        step=0.01,
+        format="%.3f",
+        key="route_meas_rot",
+        help="Rotation of the cluster on the GOT measured at the end of the line (0 = not measured).",
+    )
+    mus = tuple(float(round(v, 4)) for v in np.linspace(mu_lo, mu_hi, int(n_mu)))
+    run_key = json.dumps([names, pre, cluster_d, contact_d, sensor_d, solver_d, mus, keep_ratio], default=str)
+    st.caption(
+        f"{len(names)} recordings × {len(mus)} values of μs = {len(names) * len(mus)} simulations. Results are kept: "
+        "running again, or adding a recording, only computes what is new."
+    )
+    if st.button("Run whole-route sensitivity", type="primary", disabled=mu_hi <= mu_lo):
+        ratio = contact_d["mu_k"] / contact_d["mu_s"] if contact_d["mu_s"] > 0 else 1.0
+        pre_full = dict(pre, t_start=None, t_end=None)
+        bar = st.progress(0.0, text="Simulating...")
+        per, rel, k = [], None, 0
+        for mu in mus:
+            c_ = dict(contact_d, mu_s=mu, mu_k=mu * ratio if keep_ratio else min(contact_d["mu_k"], mu))
+            for n in names:
+                p_ = route_point(valid[n], n, pre_full, cluster_d, c_, sensor_d, solver_d)
+                rel = rel or p_["rel"]
+                per.append({"Recording": n, "mu_s": mu, **{kk: p_[kk] for kk in _SHIFT_KEYS}, "truncated": p_["truncated"]})
+                k += 1
+                bar.progress(k / (len(mus) * len(names)), text=f"μs {mu:.3f} · {n}")
+        bar.empty()
+        st.session_state["route_sweep"] = {"key": run_key, "per": pd.DataFrame(per), "rel": rel, "names": names}
+    state = st.session_state.get("route_sweep")
+    if state is None:
+        return
+    if state["key"] != run_key:
+        st.info("Settings or recordings changed since the last run. Run the whole-route sensitivity again to update.")
+    per, rel = state["per"], state["rel"]
+    tot_rows = []
+    for mu, g in per.groupby("mu_s"):
+        t_ = totals(g.to_dict("records"), rel)
+        tot_rows.append(
+            {
+                "mu_s": mu,
+                "Slip events": t_["n_events"],
+                "Slip time [s]": round(t_["slip_time_s"], 2),
+                "dX at the end [mm]": round(t_["dx_mm"], 2),
+                "dY at the end [mm]": round(t_["dy_mm"], 2),
+                "Rotation at the end [deg]": round(t_["rot_deg"], 3),
+                "Shift at the end [mm]": round(t_["corner_mm"], 2),
+                "Sum of segment shifts [mm]": round(t_["sum_segment_corner_mm"], 2),
+                "Runs stopped (long slip)": int(g["truncated"].sum()),
+            }
+        )
+    tot = pd.DataFrame(tot_rows).sort_values("mu_s").reset_index(drop=True)
+    mu_noslip = max(extras[n]["mu_noslip"] for n in state["names"] if n in extras) if extras else float("nan")
+    mu_eff_c, note_c = effective_mu(tot["mu_s"], tot["Shift at the end [mm]"], meas_c)
+    mu_eff_r, note_r = effective_mu(tot["mu_s"], tot["Rotation at the end [deg]"].abs(), meas_r)
+    f1, f2 = fig_route_sweep(tot, mu_s, mu_noslip, tol_mm, meas_c, meas_r, mu_eff_c, mu_eff_r)
+    g1, g2 = st.columns(2)
+    g1.plotly_chart(f1, config=PLOT_CONFIG, key="route_sw1")
+    g2.plotly_chart(f2, config=PLOT_CONFIG, key="route_sw2")
+    for label, measured, mu_eff, note, unit in (
+        ("corner shift", meas_c, mu_eff_c, note_c, "mm"),
+        ("rotation", meas_r, mu_eff_r, note_r, "°"),
+    ):
+        if measured <= 0:
+            continue
+        if mu_eff is not None:
+            st.success(
+                f"Measured {label} {measured:g} {unit} → the model predicts it with an effective μs ≈ {mu_eff:.3f} "
+                f"on this route (setting: {mu_s:.3f})."
+            )
+        else:
+            st.info(f"Measured {label} {measured:g} {unit}: {note}.")
+    st.caption(
+        f"Green line: from this μs on (the highest μ any recording requires) nothing slips on the route. Dashed grey: "
+        "the shift if every segment had moved the cluster the same way; the blue line is lower where shifts cancel."
+    )
+    st.dataframe(tot, hide_index=True)
+    with st.expander("Corner shift per recording and μs [mm]"):
+        order = {n: i for i, n in enumerate(state["names"])}
+        piv = per.pivot_table(index="Recording", columns="mu_s", values="corner_mm").round(2)
+        piv = piv.loc[sorted(piv.index, key=lambda n: order.get(n, 1e9))]
+        piv.columns = [f"μs {c_:.3f}" for c_ in piv.columns]
+        st.dataframe(piv)
 
 # --------------------------------------------------------------------------- #
 # Overview
@@ -1479,74 +1828,88 @@ with tab_sig, tab_guard("Signals"):
 # Slip events
 # --------------------------------------------------------------------------- #
 with tab_ev, tab_guard("Slip events"):
-    if res.events.empty:
-        st.info(
-            "No slip predicted with the current parameters. The 'Most critical moments' table in the Overview tab "
-            "lists where the margin is smallest; the Friction sensitivity tab shows at which μ slip would start."
-        )
+    ev_scope = st.radio("Show the slip events of", [SCOPE_ACTIVE, SCOPE_ROUTE], horizontal=True, key="ev_scope")
+    if ev_scope == SCOPE_ROUTE:
+        render_route_slip_events()
     else:
-        st.dataframe(events_view, hide_index=True)
-        labels = [
-            f"#{n} · {c} · {d:.3f} s · {pv}"
-            for n, c, d, pv in zip(
-                res.events["Event"], res.events["Start clock"], res.events["Duration [s]"], res.events["Pivot"]
+        if res.events.empty:
+            st.info(
+                "No slip predicted with the current parameters. The 'Most critical moments' table in the Overview tab "
+                "lists where the margin is smallest; the Friction sensitivity tab shows at which μ slip would start."
             )
-        ]
-        sel = st.selectbox("Event detail", labels)
-        ev = res.events.iloc[labels.index(sel)]
-        pad_s = max(1.0, 2.0 * float(ev["Duration [s]"]))
-        e0 = max(float(kin.t[0]), float(ev["Start [s]"]) - pad_s)
-        e1 = min(float(kin.t[-1]), float(ev["End [s]"]) + pad_s)
-        st.plotly_chart(fig_friction(res, e0, e1), config=PLOT_CONFIG, key="ev_friction")
-        c1, c2 = st.columns([3, 2])
-        with c1:
-            st.plotly_chart(fig_motion(res, tol_mm, e0, e1), config=PLOT_CONFIG, key="ev_motion")
-        with c2:
-            st.plotly_chart(fig_corner_paths(res, e0, e1), config=PLOT_CONFIG, key="ev_corners")
+        else:
+            st.dataframe(events_view, hide_index=True)
+            labels = [
+                f"#{n} · {c} · {d:.3f} s · {pv}"
+                for n, c, d, pv in zip(
+                    res.events["Event"], res.events["Start clock"], res.events["Duration [s]"], res.events["Pivot"]
+                )
+            ]
+            sel = st.selectbox("Event detail", labels)
+            ev = res.events.iloc[labels.index(sel)]
+            pad_s = max(1.0, 2.0 * float(ev["Duration [s]"]))
+            e0 = max(float(kin.t[0]), float(ev["Start [s]"]) - pad_s)
+            e1 = min(float(kin.t[-1]), float(ev["End [s]"]) + pad_s)
+            st.plotly_chart(fig_friction(res, e0, e1), config=PLOT_CONFIG, key="ev_friction")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                st.plotly_chart(fig_motion(res, tol_mm, e0, e1), config=PLOT_CONFIG, key="ev_motion")
+            with c2:
+                st.plotly_chart(fig_corner_paths(res, e0, e1), config=PLOT_CONFIG, key="ev_corners")
 
-    with st.expander("Video synchronisation", expanded=False):
-        st.caption(
-            "Load the video of the run and enter the recording clock time that corresponds to the first video frame. "
-            "The player then jumps to the selected event or critical moment."
-        )
-        vid = st.file_uploader("Video file", type=["mp4", "mov", "webm", "m4v"], key="video")
-        c1, c2 = st.columns(2)
-        v0_txt = c1.text_input("Recording clock at video 0:00 (HH:MM:SS.sss)", value=fmt_clock(raw.df["clock"].iloc[0]))
-        preroll = c2.number_input("Pre-roll [s]", value=3.0, min_value=0.0, max_value=60.0, step=1.0)
-        moments = []
-        if not res.events.empty:
-            for n, c, t_ in zip(res.events["Event"], res.events["Start clock"], res.events["Start [s]"]):
-                moments.append((f"Slip event #{n} · {c}", float(t_)))
-        for c, t_, m_ in zip(crit["Clock"], crit["Time [s]"], crit["Required mu"]):
-            moments.append((f"Critical moment · {c} · μ {m_:.3f}", float(t_)))
-        if moments:
-            choice = st.selectbox("Jump to", [m[0] for m in moments])
-            t_sel = dict(moments)[choice]
-            try:
-                day = pd.Timestamp(raw.df["clock"].iloc[0]).normalize()
-                v0 = pd.Timestamp(f"{day.date()} {v0_txt.strip()}")
-                target = pd.Timestamp(raw.df["clock"].iloc[0]) + pd.to_timedelta(t_sel, unit="s")
-                start_s = (target - v0).total_seconds() - preroll
-                st.caption(f"Video position: {max(start_s, 0):.1f} s")
-                if vid is not None:
-                    st.video(vid, start_time=int(max(0, np.floor(start_s))))
-            except Exception:  # noqa: BLE001
-                st.error("Clock time not understood. Use the format HH:MM:SS or HH:MM:SS.sss.")
+        with st.expander("Video synchronisation", expanded=False):
+            st.caption(
+                "Load the video of the run and enter the recording clock time that corresponds to the first video frame. "
+                "The player then jumps to the selected event or critical moment."
+            )
+            vid = st.file_uploader("Video file", type=["mp4", "mov", "webm", "m4v"], key="video")
+            c1, c2 = st.columns(2)
+            v0_txt = c1.text_input("Recording clock at video 0:00 (HH:MM:SS.sss)", value=fmt_clock(raw.df["clock"].iloc[0]))
+            preroll = c2.number_input("Pre-roll [s]", value=3.0, min_value=0.0, max_value=60.0, step=1.0)
+            moments = []
+            if not res.events.empty:
+                for n, c, t_ in zip(res.events["Event"], res.events["Start clock"], res.events["Start [s]"]):
+                    moments.append((f"Slip event #{n} · {c}", float(t_)))
+            for c, t_, m_ in zip(crit["Clock"], crit["Time [s]"], crit["Required mu"]):
+                moments.append((f"Critical moment · {c} · μ {m_:.3f}", float(t_)))
+            if moments:
+                choice = st.selectbox("Jump to", [m[0] for m in moments])
+                t_sel = dict(moments)[choice]
+                try:
+                    day = pd.Timestamp(raw.df["clock"].iloc[0]).normalize()
+                    v0 = pd.Timestamp(f"{day.date()} {v0_txt.strip()}")
+                    target = pd.Timestamp(raw.df["clock"].iloc[0]) + pd.to_timedelta(t_sel, unit="s")
+                    start_s = (target - v0).total_seconds() - preroll
+                    st.caption(f"Video position: {max(start_s, 0):.1f} s")
+                    if vid is not None:
+                        st.video(vid, start_time=int(max(0, np.floor(start_s))))
+                except Exception:  # noqa: BLE001
+                    st.error("Clock time not understood. Use the format HH:MM:SS or HH:MM:SS.sss.")
 
 # --------------------------------------------------------------------------- #
 # Friction sensitivity
 # --------------------------------------------------------------------------- #
 with tab_sens, tab_guard("Friction sensitivity"):
-    st.caption(
-        "Repeats the simulation for a range of static friction coefficients (same record and settings). "
-        "Use it to judge how sensitive the result is to surface condition, contamination or material changes."
-    )
+    fs_scope = st.radio("Run for", [SCOPE_ACTIVE, SCOPE_ROUTE], horizontal=True, key="fs_scope")
+    if fs_scope == SCOPE_ROUTE:
+        st.caption(
+            "Repeats the simulation of every uploaded recording for a range of static friction coefficients and adds "
+            "the shifts up along the line (ST 130 → buffer), as if one part had travelled all the measured segments. "
+            "Enter what you measure on the part at the end of the line to find the friction that explains it."
+        )
+    else:
+        st.caption(
+            "Repeats the simulation for a range of static friction coefficients (same record and settings). "
+            "Use it to judge how sensitive the result is to surface condition, contamination or material changes."
+        )
     c1, c2, c3, c4 = st.columns(4)
     mu_lo = c1.number_input("μs from", value=0.10, min_value=0.01, max_value=2.0, step=0.01, format="%.2f")
     mu_hi = c2.number_input("μs to", value=0.40, min_value=0.02, max_value=2.0, step=0.01, format="%.2f")
     n_mu = c3.number_input("Steps", value=7, min_value=2, max_value=25, step=1)
     keep_ratio = c4.toggle("Keep μk/μs ratio", value=True)
-    if st.button("Run sensitivity analysis", type="primary"):
+    if fs_scope == SCOPE_ROUTE:
+        render_route_sweep(float(mu_lo), float(mu_hi), int(n_mu), bool(keep_ratio))
+    elif st.button("Run sensitivity analysis", type="primary"):
         if mu_hi <= mu_lo:
             st.error("The upper μ must be larger than the lower μ.")
         else:
@@ -1556,7 +1919,7 @@ with tab_sens, tab_guard("Friction sensitivity"):
                     "key": (active, json.dumps([pre, cluster_d, contact_d, sensor_d, solver_d], default=str)),
                     "df": run_sweep(data, active, pre, cluster_d, contact_d, sensor_d, solver_d, mus, keep_ratio),
                 }
-    sw_state = st.session_state.get("sweep")
+    sw_state = st.session_state.get("sweep") if fs_scope == SCOPE_ACTIVE else None
     if sw_state is not None:
         if sw_state["key"] != (active, json.dumps([pre, cluster_d, contact_d, sensor_d, solver_d], default=str)):
             st.info("Parameters changed since the last run. Re-run the sensitivity analysis to update.")
@@ -1702,7 +2065,7 @@ with tab_cmp, tab_guard("Compare recordings"):
             "settings. Recordings are listed in time order (oldest first)."
         )
         with st.spinner("Simulating all recordings..."):
-            rows, peaks_map, row_errors = all_recording_rows()
+            rows, peaks_map, row_errors, _extras = all_recording_rows()
         for msg in row_errors:
             st.warning(msg)
         if rows:
@@ -1823,7 +2186,7 @@ with tab_cmp, tab_guard("Compare recordings"):
 # --------------------------------------------------------------------------- #
 with tab_map, tab_guard("Line map"):
     with st.spinner("Simulating all recordings..."):
-        map_rows, map_peaks, map_errors = all_recording_rows()
+        map_rows, map_peaks, map_errors, _map_extras = all_recording_rows()
     for msg in map_errors:
         st.warning(msg)
     if map_rows:
@@ -1927,6 +2290,16 @@ A name with one station only (`St989`, `St540 deindex`, `St540Loop540`) is a pro
 deindexing, ...), not a transport, and is drawn as a ring at the station. Where the carrier takes another way, the
 stations it passes can be added as *Via* in the sections table. The map tells in which section μs is exceeded and
 how often, not where inside the section.
+
+#### Whole route (Slip events and Friction sensitivity tabs)
+
+Every recording is simulated on its own over its full length, starting with the cluster in its nominal position, and
+the recordings are put in line order (ST 130 → buffer) from their file names. The cluster shift of each recording is
+a translation of the centre of mass and a rotation in the carrier (GOT) frame, the same for every recording, so the
+shifts add up: U = Σ u_i, φ = Σ φ_i, and the shift of a corner is U + (R(φ) − I)·r_c. This is valid for shifts of
+millimetres; shifts in opposite directions cancel. Repeated measurements of the same section should be left out,
+otherwise they are added twice. With the shift measured on the part at the end of the line, the friction sweep gives
+the effective μs at which the model predicts the same shift (linear interpolation between the computed μ values).
 
 #### Assumptions and limits
 

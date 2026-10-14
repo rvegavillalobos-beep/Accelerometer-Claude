@@ -10,6 +10,8 @@ _LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale mo
 
 IMAGE_FILE = "assets/line_layout.png"
 IMAGE_SIZE = (1354, 702)
+FLOW_START = 'ST130'  # carriers enter the drawn line here
+FLOW_END = 'BUFFER'  # ... and leave it here
 
 # station key -> (display name, node)
 STATIONS = {'BUFFER': ('Buffer', 38),

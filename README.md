@@ -28,6 +28,10 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   carrier rotation, maximum friction demand and slip.
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings
   (highest required μ per recording, plus every distinct exceedance of μs marked at its peak and counted).
+- Whole route (Slip events and Friction sensitivity tabs): all uploaded recordings put in line order (ST 130 →
+  buffer) and added up, as if one part had travelled all the measured segments: slip events of every recording,
+  shift accumulated along the route, and the friction sweep for the whole route with the effective μ that explains
+  the shift measured on the part at the end of the line.
 - Line map tab: the plant layout, the conveyor path and the station positions are embedded in the app. Every
   uploaded recording (one or more) is drawn where its file name says it was measured: `St430-440` as the transport
   along the conveyors in the flow direction (ST 130 → buffer), `St981-Buffer` to the buffer, and a name with one
@@ -58,6 +62,7 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `turns.py` | Turntable / rotation detection and analysis |
 | `motion.py` | Travel direction and motion phase of the carrier |
 | `visuals.py` | Plotly figures and the animated top view |
+| `whole_route.py` | Shifts of all recordings added up along the line, effective μ from a measured shift |
 | `line_layout.py` | File names → line sections, shortest way along the conveyors, loops |
 | `line_layout_data.py` | Embedded conveyor graph and station table (generated) |
 | `assets/line_layout.png` | Layout background of the line map (generated) |

@@ -531,7 +531,9 @@ def write_data(W, H, nodes, edges, stations) -> None:
         "assets/source/line_layout_paths.png - edit STATION_LABELS / FLOW_* in that script and run it again instead of\n"
         'editing this file by hand.\n\nCoordinates are pixels of assets/line_layout.png (x to the right, y downwards)."""\n\n'
         "import os as _os\n\n_LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale modules\n\n"
-        f"IMAGE_FILE = \"assets/line_layout.png\"\nIMAGE_SIZE = ({W}, {H})\n\n"
+        f"IMAGE_FILE = \"assets/line_layout.png\"\nIMAGE_SIZE = ({W}, {H})\n"
+        f"FLOW_START = {FLOW_START!r}  # carriers enter the drawn line here\n"
+        f"FLOW_END = {FLOW_END!r}  # ... and leave it here\n\n"
         "# station key -> (display name, node)\n"
         f"STATIONS = {pprint.pformat(st, width=118, sort_dicts=True)}\n\n"
         "# node -> (x, y)\n"

@@ -246,6 +246,41 @@ def section_label(row) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Order along the line
+# --------------------------------------------------------------------------- #
+@lru_cache(maxsize=1)
+def _flow_distance() -> dict[int, float]:
+    """Distance of every node from the start of the line, along the conveyors in the flow direction [px]."""
+    start = _D.STATIONS[getattr(_D, "FLOW_START", "ST130")][1]
+    adj = _adjacency(True)
+    dist, heap = {start: 0.0}, [(0.0, start)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d > dist.get(u, INF):
+            continue
+        for v, length, _k in adj[u]:
+            if d + length < dist.get(v, INF):
+                dist[v] = d + length
+                heapq.heappush(heap, (d + length, v))
+    return dist
+
+
+def flow_position(key: str | None) -> float:
+    """Position of a station along the line (distance from the start in the flow direction); inf if unknown."""
+    if not key or key not in _D.STATIONS:
+        return INF
+    return _flow_distance().get(_D.STATIONS[key][1], INF)
+
+
+def route_order(row) -> tuple:
+    """Sort key of a row of the sections table: where along the line it is (a process inside a station comes
+    before the transport that leaves the station)."""
+    a, b, via = section_keys(row)
+    single = b is None and not via
+    return (flow_position(a), 0 if single else 1, flow_position(b) if b else 0.0, str(row.get("Recording", "")))
+
+
+# --------------------------------------------------------------------------- #
 # Drawing data
 # --------------------------------------------------------------------------- #
 def image_size() -> tuple[int, int]:

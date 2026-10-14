@@ -1362,3 +1362,146 @@ def fig_line_map(
     fig.update_layout(title=dict(text="Exceedances of μs per line section (number = count)", x=0, font=dict(size=14)))
     height = int(min(1000, max(460, 1150 * H / max(W, 1) + 60)))
     return _layout_canvas(fig, img_uri, W, H, height)
+
+
+# --------------------------------------------------------------------------- #
+# Whole route (all recordings added up)
+# --------------------------------------------------------------------------- #
+def fig_route_progress(prog: pd.DataFrame, tolerance_mm: float, mu_s: float) -> go.Figure:
+    """Shift of every segment on its own (bars) and the cluster shift accumulated along the route (line)."""
+    labels = [str(r).rsplit(".", 1)[0] for r in prog["Recording"]]
+    seg = prog["Segment corner shift [mm]"].to_numpy(dtype=float)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=seg,
+            name="Segment on its own",
+            marker=dict(color=[CRITICAL if v > 0 else C1 for v in seg]),
+            hovertemplate="%{x}<br>Segment shift %{y:.2f} mm<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=labels,
+            y=prog["Cumulative max corner shift [mm]"],
+            mode="lines+markers",
+            name="Accumulated along the route",
+            line=dict(color=INK_2, width=2.5),
+            marker=dict(size=8),
+            customdata=np.c_[
+                prog["Cumulative dX [mm]"], prog["Cumulative dY [mm]"], prog["Cumulative rotation [deg]"]
+            ],
+            hovertemplate="%{x}<br>Accumulated max corner shift %{y:.2f} mm<br>dX %{customdata[0]:.2f} mm · "
+            "dY %{customdata[1]:.2f} mm · rotation %{customdata[2]:.3f}°<extra></extra>",
+        )
+    )
+    fig.add_hline(
+        y=tolerance_mm,
+        line=dict(color=CRITICAL, width=1.2, dash="dot"),
+        annotation_text=f"Allowed {tolerance_mm:g} mm",
+        annotation_position="top left",
+        annotation_font_color=CRITICAL,
+    )
+    fig.update_yaxes(title_text="Max corner shift [mm]", rangemode="tozero")
+    fig.update_xaxes(title_text="Recordings in line order (ST 130 → buffer)", tickangle=-35)
+    fig.update_layout(
+        title=dict(text=f"Cluster shift along the route (μs {mu_s:.3f})", x=0, font=dict(size=14)),
+        height=430,
+        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="closest",
+        bargap=0.35,
+    )
+    return fig
+
+
+def fig_route_sweep(
+    tot: pd.DataFrame,
+    mu_now: float,
+    mu_noslip: float,
+    tolerance_mm: float,
+    measured_corner_mm: float = 0.0,
+    measured_rot_deg: float = 0.0,
+    mu_eff_corner: float | None = None,
+    mu_eff_rot: float | None = None,
+) -> tuple[go.Figure, go.Figure]:
+    """Shift and rotation at the end of the whole route against μs, with the measured values if given."""
+    f1, f2 = go.Figure(), go.Figure()
+    f1.add_trace(
+        go.Scatter(
+            x=tot["mu_s"],
+            y=tot["Shift at the end [mm]"],
+            mode="lines+markers",
+            name="At the end of the route",
+            line=dict(color=C1, width=2.5),
+            marker=dict(size=9),
+            hovertemplate="μs %{x:.3f}<br>%{y:.2f} mm at the end<extra></extra>",
+        )
+    )
+    f1.add_trace(
+        go.Scatter(
+            x=tot["mu_s"],
+            y=tot["Sum of segment shifts [mm]"],
+            mode="lines",
+            name="Sum of the segments (all in one direction)",
+            line=dict(color=MUTED, width=1.5, dash="dash"),
+            hovertemplate="μs %{x:.3f}<br>%{y:.2f} mm if every shift went the same way<extra></extra>",
+        )
+    )
+    f1.add_hline(
+        y=tolerance_mm,
+        line=dict(color=CRITICAL, width=1.2, dash="dot"),
+        annotation_text=f"Allowed {tolerance_mm:g} mm",
+        annotation_position="top right",
+        annotation_font_color=CRITICAL,
+    )
+    f2.add_trace(
+        go.Scatter(
+            x=tot["mu_s"],
+            y=tot["Rotation at the end [deg]"].abs(),
+            mode="lines+markers",
+            name="At the end of the route",
+            line=dict(color=C1, width=2.5),
+            marker=dict(size=9),
+            hovertemplate="μs %{x:.3f}<br>%{y:.3f}° at the end<extra></extra>",
+        )
+    )
+    for f, measured, mu_eff, unit in ((f1, measured_corner_mm, mu_eff_corner, "mm"), (f2, measured_rot_deg, mu_eff_rot, "°")):
+        if measured > 0:
+            f.add_hline(
+                y=measured,
+                line=dict(color=C2, width=2),
+                annotation_text=f"Measured {measured:g} {unit}",
+                annotation_position="bottom right",
+                annotation_font_color=C2,
+            )
+        if mu_eff is not None:
+            f.add_vline(
+                x=mu_eff,
+                line=dict(color=C2, width=2, dash="dash"),
+                annotation_text=f"Effective μs ≈ {mu_eff:.3f}",
+                annotation_position="top left",
+                annotation_font_color=C2,
+            )
+        f.add_vline(
+            x=mu_now,
+            line=dict(color=INK_2, width=1),
+            annotation_text=f"μs setting {mu_now:.3f}",
+            annotation_position="top right",
+        )
+        if np.isfinite(mu_noslip):
+            f.add_vline(
+                x=mu_noslip,
+                line=dict(color=C3, width=1.5),
+                annotation_text=f"No slip on the route ≥ {mu_noslip:.3f}",
+                annotation_position="bottom left",
+            )
+        f.update_xaxes(title_text="Static friction coefficient μs [-]")
+        f.update_layout(height=400, margin=dict(l=10, r=10, t=50, b=10), hovermode="closest",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    f1.update_yaxes(title_text="Max corner shift at the end [mm]", rangemode="tozero")
+    f2.update_yaxes(title_text="|Rotation| at the end [deg]", rangemode="tozero")
+    f1.update_layout(title=dict(text="Whole route: corner shift at the end", x=0, font=dict(size=14)))
+    f2.update_layout(title=dict(text="Whole route: cluster rotation at the end", x=0, font=dict(size=14)), showlegend=False)
+    return f1, f2
