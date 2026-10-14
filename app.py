@@ -69,7 +69,6 @@ _reload_stale_local_modules()
 from data_io import (
     PreprocessSettings,
     RawRecording,
-    kinematics_table,
     native_rate,
     preprocess,
     read_witmotion,
@@ -84,7 +83,6 @@ from slip_model import (
     critical_moments,
     exceedance_peaks,
     friction_sweep,
-    results_table,
     simulate,
     summary,
 )
@@ -136,7 +134,7 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
@@ -1055,11 +1053,26 @@ tabs = st.tabs(
         "Slip events",
         "Friction sensitivity",
         "Compare recordings",
-        "Export",
+        "Line map",
         "Method",
     ]
 )
-tab_over, tab_meas, tab_turn, tab_speed, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab_exp, tab_meth = tabs
+tab_over, tab_meas, tab_turn, tab_speed, tab_anim, tab_sig, tab_ev, tab_sens, tab_cmp, tab_map, tab_meth = tabs
+
+
+def all_recording_rows() -> tuple[list[dict], dict[str, pd.DataFrame], list[str]]:
+    """Summary and exceedances of μs of every uploaded recording, simulated over its full length (cached)."""
+    rows, peaks, errors = [], {}, []
+    pre_full = dict(pre, t_start=None, t_end=None)
+    for name, d in valid.items():
+        try:
+            row_i, pk_i = compare_row(d, name, pre_full, cluster_d, contact_d, sensor_d, solver_d, asdict(turn_s), mu_s)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{name}: {exc}")
+            continue
+        peaks[name] = pk_i
+        rows.append(row_i)
+    return rows, peaks, errors
 
 # --------------------------------------------------------------------------- #
 # Overview
@@ -1560,16 +1573,16 @@ with tab_sens, tab_guard("Friction sensitivity"):
 # --------------------------------------------------------------------------- #
 # Line layout map (Compare tab)
 # --------------------------------------------------------------------------- #
-def render_line_map(recordings: list[str], cmp_df: pd.DataFrame, peaks_map: dict, mu_s: float) -> None:
+def render_line_map(cmp_df: pd.DataFrame, peaks_map: dict, mu_s: float) -> None:
     """Every recording drawn along the conveyor path its file name describes, coloured by exceedances of μs."""
-    st.divider()
-    st.markdown("##### Exceedances on the line layout")
+    recordings = list(cmp_df["Recording"])
     st.caption(
-        "Each recording is drawn along the conveyors between the stations in its file name: **St430-440** "
-        "(from ST 430 to ST 440), **St989** or **St540 deindex** (one station; text after the number is a note), "
-        "**St540Loop540** (the conveyor loop through ST 540), **St981-Buffer** (to the buffer). Routes follow the "
-        "flow direction (ST 130 → buffer, grey arrows). Red = μs exceeded, the badge is the number of exceedances. "
-        "The map shows in which section, not where inside it."
+        "Every uploaded recording is simulated over its full length and drawn where its file name says it was "
+        "measured. **St430-440**: transport from ST 430 to ST 440, drawn along the conveyors in the flow direction "
+        "(ST 130 → buffer, grey arrows). **St989**, **St540 deindex**, **St540Loop540**: one station only, i.e. a "
+        "process inside the station (indexing, deindexing, ...), drawn as a ring. **St981-Buffer**: transport to "
+        "the buffer. Red = μs exceeded, the badge is the number of exceedances. The map shows in which section, "
+        "not where inside it."
     )
     map_box = st.container()
     with st.expander("Sections from the file names", expanded=False):
@@ -1660,8 +1673,9 @@ def render_line_map(recordings: list[str], cmp_df: pd.DataFrame, peaks_map: dict
         n_bad = sum(1 for g in drawn if g["n_exc"] > 0)
         st.caption(
             f"{n_bad} of {len(drawn)} sections exceed μs = {mu_s:.3f}. Grey = conveyor path, red = μs exceeded "
-            "(the line gets thicker with more exceedances), blue = measured without exceedance, ring = one station, "
-            "dotted = loop. Hover a badge for the recordings and times; the camera icon saves the map as an image."
+            "(the line gets thicker with more exceedances), blue = measured without exceedance, ring = process inside "
+            "a station. "
+            "Hover a badge for the recordings and times; the camera icon saves the map as an image."
         )
         tab = pd.DataFrame(
             [
@@ -1687,20 +1701,10 @@ with tab_cmp, tab_guard("Compare recordings"):
             "Every recording is simulated over its full length with the current mounting, cluster and friction "
             "settings. Recordings are listed in time order (oldest first)."
         )
-        rows = []
-        peaks_map: dict[str, pd.DataFrame] = {}
         with st.spinner("Simulating all recordings..."):
-            pre_full = dict(pre, t_start=None, t_end=None)
-            for name, d in valid.items():
-                try:
-                    row_i, pk_i = compare_row(
-                        d, name, pre_full, cluster_d, contact_d, sensor_d, solver_d, asdict(turn_s), mu_s
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    st.warning(f"{name}: {exc}")
-                    continue
-                peaks_map[name] = pk_i
-                rows.append(row_i)
+            rows, peaks_map, row_errors = all_recording_rows()
+        for msg in row_errors:
+            st.warning(msg)
         if rows:
             cmp_df = pd.DataFrame(rows)
             st.plotly_chart(fig_compare(cmp_df, mu_s, peaks_map), config=PLOT_CONFIG, key="cmp")
@@ -1713,7 +1717,6 @@ with tab_cmp, tab_guard("Compare recordings"):
             st.download_button(
                 "Download comparison (CSV)", cmp_df.to_csv(index=False).encode(), "comparison.csv", "text/csv"
             )
-            render_line_map(list(cmp_df["Recording"]), cmp_df, peaks_map, mu_s)
 
     # ------------------------------------------------------------------ #
     # Compare turntable rotations between recordings
@@ -1816,77 +1819,17 @@ with tab_cmp, tab_guard("Compare recordings"):
         )
 
 # --------------------------------------------------------------------------- #
-# Export
+# Line map
 # --------------------------------------------------------------------------- #
-with tab_exp, tab_guard("Export"):
-    stem = active.rsplit(".", 1)[0]
-    params = {
-        "app_version": APP_VERSION,
-        "recording": active,
-        "preprocessing": pre,
-        "cluster": cluster_d,
-        "contact": contact_d,
-        "sensor": sensor_d,
-        "solver": solver_d,
-        "allowed_corner_displacement_mm": tol_mm,
-        "turntable_detection": asdict(turn_s),
-        "travel_direction": asdict(travel_s),
-        "travel_direction_overrides": travel_overrides,
-        "summary": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in sm.items()},
-    }
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "Simulation time series (CSV)",
-            results_table(res).to_csv(index=False).encode(),
-            f"{stem}_simulation.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "Slip events (CSV)",
-            events_view.to_csv(index=False).encode(),
-            f"{stem}_slip_events.csv",
-            "text/csv",
-            disabled=res.events.empty,
-        )
-        st.download_button(
-            "Critical moments (CSV)", crit.to_csv(index=False).encode(), f"{stem}_critical_moments.csv", "text/csv"
-        )
-        st.download_button(
-            "Turntable rotations (CSV)",
-            turn_tab.to_csv(index=False).encode(),
-            f"{stem}_turntables.csv",
-            "text/csv",
-            disabled=turn_tab.empty,
-        )
-        st.download_button(
-            "Speed profile per segment (CSV)",
-            speed_tab.to_csv(index=False).encode(),
-            f"{stem}_speed_segments.csv",
-            "text/csv",
-            disabled=speed_tab.empty,
-        )
-        st.download_button(
-            "Motion segments / travel direction (CSV)",
-            segments_table(motion_segs, travel_overrides).to_csv(index=False).encode(),
-            f"{stem}_motion_segments.csv",
-            "text/csv",
-            disabled=not motion_segs,
-        )
-    with c2:
-        st.download_button(
-            "Carrier kinematics (CSV)",
-            kinematics_table(kin).to_csv(index=False).encode(),
-            f"{stem}_kinematics.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "Parameters and summary (JSON)",
-            json.dumps(params, indent=2, default=str).encode(),
-            f"{stem}_parameters.json",
-            "application/json",
-        )
-    st.caption("Time series are exported at the simulation sample rate. Distances in mm, angles in degrees.")
+with tab_map, tab_guard("Line map"):
+    with st.spinner("Simulating all recordings..."):
+        map_rows, map_peaks, map_errors = all_recording_rows()
+    for msg in map_errors:
+        st.warning(msg)
+    if map_rows:
+        render_line_map(pd.DataFrame(map_rows), map_peaks, mu_s)
+    else:
+        st.info("None of the uploaded recordings could be simulated.")
 
 # --------------------------------------------------------------------------- #
 # Method
@@ -1979,10 +1922,11 @@ The plant layout, the conveyor path and the station positions are embedded in th
 layout with the path drawn in red). The conveyors are directed: carriers flow from ST 130 to the buffer; side
 branches that leave and rejoin the main line run in the same direction, and the loop through ST 540 returns
 upstream (20 → 21 → ST 540 → 23 → 18). Every recording is drawn as the shortest way in the flow direction between
-the stations in its file name (`St<from>-<to>`; a name written against the flow is drawn on the same stretch);
-`St<station>` is drawn as a ring at the station and a name with *Loop* (`St540Loop540`) as the smallest loop through
-the station. Where the carrier takes another way, the stations it passes can be added as *Via* in the sections
-table. The map tells in which section μs is exceeded and how often, not where inside the section.
+the stations in its file name (`St<from>-<to>`; a name written against the flow is drawn on the same stretch).
+A name with one station only (`St989`, `St540 deindex`, `St540Loop540`) is a process inside the station (indexing,
+deindexing, ...), not a transport, and is drawn as a ring at the station. Where the carrier takes another way, the
+stations it passes can be added as *Via* in the sections table. The map tells in which section μs is exceeded and
+how often, not where inside the section.
 
 #### Assumptions and limits
 
