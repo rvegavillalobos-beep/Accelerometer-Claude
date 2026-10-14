@@ -1150,3 +1150,195 @@ def fig_measure_detail(
         showlegend=False,
     )
     return fig
+
+
+# --------------------------------------------------------------------------- #
+# Line layout map (Compare tab)
+# --------------------------------------------------------------------------- #
+LAYOUT_OK = C1  # measured, μs never exceeded
+LAYOUT_BAD = CRITICAL  # μs exceeded at least once
+LAYOUT_NET = "#8f8d87"  # conveyor path
+
+
+def _layout_canvas(fig: go.Figure, img_uri: str, W: int, H: int, height: int) -> go.Figure:
+    """Layout image as background. Plot coordinates: x = image x, y = H - image y (image y points down)."""
+    fig.add_layout_image(
+        dict(
+            source=img_uri,
+            xref="x",
+            yref="y",
+            x=0,
+            y=H,
+            sizex=W,
+            sizey=H,
+            sizing="stretch",
+            opacity=0.5,
+            layer="below",
+            xanchor="left",
+            yanchor="top",
+        )
+    )
+    fig.update_xaxes(range=[0, W], visible=False, showgrid=False, zeroline=False, constrain="domain")
+    fig.update_yaxes(range=[0, H], visible=False, showgrid=False, zeroline=False, scaleanchor="x", scaleratio=1)
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=40, b=0),
+        plot_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
+        hovermode="closest",
+        uirevision="line-layout",
+        dragmode="pan",
+    )
+    return fig
+
+
+def _poly_midpoint(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    if len(xs) == 1:
+        return xs[0], ys[0]
+    seg = np.hypot(np.diff(xs), np.diff(ys))
+    half = 0.5 * float(seg.sum())
+    for i, L in enumerate(seg):
+        if half <= L and L > 0:
+            f = half / L
+            return xs[i] + f * (xs[i + 1] - xs[i]), ys[i] + f * (ys[i + 1] - ys[i])
+        half -= L
+    return xs[-1], ys[-1]
+
+
+def fig_line_map(
+    img_uri: str,
+    W: int,
+    H: int,
+    network: list[list[tuple[float, float]]],
+    sections: list[dict],
+    stations: pd.DataFrame,
+    mu_s: float,
+) -> go.Figure:
+    """Plant layout with the conveyor path; every measured section drawn along the conveyors, red where μs was
+    exceeded (badge = number of exceedances), blue otherwise. Loops are drawn as the loop, single stations as a ring.
+
+    sections: dicts with label, kind ('route' / 'loop' / 'point'), path [(x, y) image px], keys, n_exc, mu_max,
+    recordings, n_per_rec, times.
+    """
+    fig = go.Figure()
+    # the whole conveyor path, for reference
+    nx_, ny_ = [], []
+    for pts in network:
+        nx_ += [p[0] for p in pts] + [None]
+        ny_ += [H - p[1] for p in pts] + [None]
+    fig.add_trace(
+        go.Scatter(
+            x=nx_,
+            y=ny_,
+            mode="lines",
+            line=dict(color=LAYOUT_NET, width=2.5),
+            opacity=0.55,
+            name="Conveyor path",
+            hoverinfo="skip",
+        )
+    )
+    shown = {"ok": False, "bad": False}
+    badges = []
+    for sec in sorted(sections, key=lambda d: d["n_exc"]):
+        path = sec["path"]
+        if not path:
+            continue
+        bad = sec["n_exc"] > 0
+        col = LAYOUT_BAD if bad else LAYOUT_OK
+        group = "bad" if bad else "ok"
+        name = "μs exceeded (number = count)" if bad else "Measured, μs not exceeded"
+        xs = [p[0] for p in path]
+        ys = [H - p[1] for p in path]
+        if sec["kind"] == "point":
+            fig.add_trace(
+                go.Scatter(
+                    x=xs[:1],
+                    y=ys[:1],
+                    mode="markers",
+                    marker=dict(symbol="circle-open", size=28 if bad else 22, line=dict(color=col, width=4 if bad else 3)),
+                    name=name,
+                    legendgroup=group,
+                    showlegend=not shown[group],
+                    hoverinfo="skip",
+                )
+            )
+            mx, my = xs[0], ys[0] + 0.045 * H  # badge above the station
+        else:
+            width = 4.0 if not bad else 5.0 + 1.2 * min(sec["n_exc"], 6)
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    line=dict(color=col, width=width, dash="dot" if sec["kind"] == "loop" else None),
+                    opacity=0.9,
+                    name=name,
+                    legendgroup=group,
+                    showlegend=not shown[group],
+                    hoverinfo="skip",
+                )
+            )
+            mx, my = _poly_midpoint(xs, ys)
+        shown[group] = True
+        recs = "<br>".join(
+            f"· {r}: {n}×" + (f" ({', '.join(t[:4])}{' …' if len(t) > 4 else ''})" if t else "")
+            for r, n, t in zip(sec["recordings"], sec["n_per_rec"], sec["times"])
+        )
+        mu_txt = f"{sec['mu_max']:.3f}" if np.isfinite(sec["mu_max"]) else "-"
+        hover = (
+            f"<b>{sec['label']}</b><br>Exceedances of μs ({mu_s:.3f}): <b>{sec['n_exc']}</b>"
+            f"<br>Highest required μ: {mu_txt}<br>{recs}"
+        )
+        badges.append([mx, my, sec["n_exc"], hover])
+
+    # keep badges from covering each other
+    r = 0.022 * max(W, H)
+    for i in range(len(badges)):
+        for _ in range(10):
+            if not any(abs(badges[i][0] - b[0]) < r and abs(badges[i][1] - b[1]) < 0.8 * r for b in badges[:i]):
+                break
+            badges[i][1] += 0.9 * r
+    for bad in (False, True):
+        sel = [b for b in badges if (b[2] > 0) == bad]
+        if not sel:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=[b[0] for b in sel],
+                y=[b[1] for b in sel],
+                mode="markers+text" if bad else "markers",
+                marker=dict(
+                    symbol="square",
+                    size=24 if bad else 10,
+                    color=LAYOUT_BAD if bad else "white",
+                    line=dict(color="white" if bad else LAYOUT_OK, width=1.5 if bad else 2),
+                ),
+                text=[f"{b[2]}×" for b in sel] if bad else None,
+                textposition="middle center",
+                textfont=dict(color="white", size=12),
+                hovertext=[b[3] for b in sel],
+                hoverinfo="text",
+                showlegend=False,
+            )
+        )
+    # ends of the measured sections
+    used = {k for sec in sections for k in sec.get("keys", []) if sec["path"]}
+    st_used = stations[stations["Key"].isin(used)] if len(stations) else stations
+    if len(st_used):
+        fig.add_trace(
+            go.Scatter(
+                x=st_used["x"],
+                y=H - st_used["y"],
+                mode="markers+text",
+                marker=dict(size=8, color=INK_2, line=dict(color="white", width=1.5)),
+                text=st_used["Station"],
+                textposition="top center",
+                textfont=dict(size=11, color="#1b1b1b"),
+                hovertext=st_used["Station"],
+                hoverinfo="text",
+                showlegend=False,
+            )
+        )
+    fig.update_layout(title=dict(text="Exceedances of μs per line section (number = count)", x=0, font=dict(size=14)))
+    height = int(min(1000, max(460, 1150 * H / max(W, 1) + 60)))
+    return _layout_canvas(fig, img_uri, W, H, height)

@@ -35,7 +35,7 @@ import streamlit as st
 # Local modules in dependency order. After a git push, Streamlit Cloud can rerun the new app.py while older
 # versions of these modules are still loaded in the Python process (ImportError on new names). Every module
 # stores the mtime of its source file when it is loaded; if any file on disk is newer, all are reloaded.
-_LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "visuals")
+_LOCAL_MODULES = ("data_io", "slip_model", "turns", "motion", "line_layout_data", "line_layout", "visuals")
 
 
 def _local_modules_stale() -> bool:
@@ -98,6 +98,11 @@ from motion import (
     segments_table,
     travel_arrays,
 )
+from line_layout import background_uri as layout_background_uri
+from line_layout import image_size as layout_image_size
+from line_layout import known_stations, section_geometry, section_label, sections_table, station_display
+from line_layout import network as layout_network
+from line_layout import stations_table as layout_stations
 from turns import (
     TurnSettings,
     analyse_rotations,
@@ -114,6 +119,7 @@ from visuals import (
     friction_demand_g,
     fig_friction,
     fig_kinematics,
+    fig_line_map,
     fig_motion,
     fig_sweep,
     dynamic_limit_g,
@@ -1550,6 +1556,119 @@ with tab_sens, tab_guard("Friction sensitivity"):
 # --------------------------------------------------------------------------- #
 # Compare recordings
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Line layout map (Compare tab)
+# --------------------------------------------------------------------------- #
+def render_line_map(recordings: list[str], cmp_df: pd.DataFrame, peaks_map: dict, mu_s: float) -> None:
+    """Every recording drawn along the conveyor path its file name describes, coloured by exceedances of μs."""
+    st.divider()
+    st.markdown("##### Exceedances on the line layout")
+    st.caption(
+        "Each recording is drawn along the conveyors between the stations in its file name: **St430-440** "
+        "(from ST 430 to ST 440), **St989** or **St540 deindex** (one station; text after the number is a note), "
+        "**St540Loop540** (the conveyor loop through ST 540), **St981-Buffer** (to the buffer). Red = μs exceeded, "
+        "the badge is the number of exceedances. The map shows in which section, not where inside it."
+    )
+    map_box = st.container()
+    with st.expander("Sections from the file names", expanded=False):
+        st.caption(
+            "Read from the file names. Correct a row here if a name does not follow the convention. **Via**: "
+            "stations the carrier passes, separated by commas, when the shortest way along the conveyors is not "
+            "the one it takes. Stations on the layout: "
+            + ", ".join(station_display(k) for k in known_stations())
+            + "."
+        )
+        base = sections_table(recordings)
+        ed_key = "line_sections_" + hashlib.md5(base.to_json().encode()).hexdigest()[:10]
+        sections = st.data_editor(base, key=ed_key, hide_index=True, disabled=["Recording"])
+    sections = pd.DataFrame(sections).fillna("")
+
+    row_of = {r["Recording"]: r for _, r in cmp_df.iterrows()}
+    groups: dict[tuple, dict] = {}
+    unmapped: list[tuple[str, dict]] = []
+    for _, row in sections.iterrows():
+        rec = row["Recording"]
+        geo = section_geometry(row)
+        pk = peaks_map.get(rec)
+        n = 0 if pk is None else len(pk)
+        times = [] if pk is None or not len(pk) else [str(c) for c in pk["Clock"].tolist()]
+        mu_max = float(row_of[rec]["Required μ (no slip)"]) if rec in row_of else float("nan")
+        if not geo["path"]:
+            unmapped.append((rec, geo))
+            key = ("unmapped", rec)
+        else:
+            key = (geo["kind"], tuple(geo["keys"]))
+        g = groups.setdefault(
+            key,
+            {
+                "label": section_label(row),
+                "kind": geo["kind"],
+                "path": geo["path"],
+                "keys": geo["keys"],
+                "geo": geo,
+                "n_exc": 0,
+                "mu_max": float("nan"),
+                "recordings": [],
+                "n_per_rec": [],
+                "times": [],
+                "notes": set(),
+            },
+        )
+        g["n_exc"] += n
+        if np.isfinite(mu_max):
+            g["mu_max"] = mu_max if not np.isfinite(g["mu_max"]) else max(g["mu_max"], mu_max)
+        g["recordings"].append(rec)
+        g["n_per_rec"].append(n)
+        g["times"].append(times)
+        g["notes"].add(str(row.get("Note") or ""))
+        if len(g["notes"]) > 1:  # several recordings with different notes on the same section
+            g["label"] = section_label(dict(row, Note=""))
+    secs = list(groups.values())
+
+    with map_box:
+        W, H = layout_image_size()
+        st.plotly_chart(
+            fig_line_map(layout_background_uri(), W, H, layout_network(), [g for g in secs if g["path"]],
+                         layout_stations(), mu_s),
+            config=PLOT_CONFIG,
+            key="line_map",
+        )
+        if unmapped:
+            parts = []
+            for rec, geo in unmapped:
+                if geo["kind"] == "missing":
+                    parts.append(f"{rec} ({', '.join(station_display(k) for k in geo['missing'])} not on the layout)")
+                elif geo["kind"] == "no_path":
+                    parts.append(f"{rec} (no conveyor connection between its stations)")
+                else:
+                    parts.append(f"{rec} (no station in the file name)")
+            st.warning(
+                f"{len(unmapped)} recording(s) not on the map: " + "; ".join(parts) + ". Correct them under "
+                "**Sections from the file names**."
+            )
+        drawn = [g for g in secs if g["path"]]
+        n_bad = sum(1 for g in drawn if g["n_exc"] > 0)
+        st.caption(
+            f"{n_bad} of {len(drawn)} sections exceed μs = {mu_s:.3f}. Grey = conveyor path, red = μs exceeded "
+            "(the line gets thicker with more exceedances), blue = measured without exceedance, ring = one station, "
+            "dotted = loop. Hover a badge for the recordings and times; the camera icon saves the map as an image."
+        )
+        tab = pd.DataFrame(
+            [
+                {
+                    "Section": g["label"],
+                    "Recordings": ", ".join(g["recordings"]),
+                    "Exceedances of μs": g["n_exc"],
+                    "Highest required μ": round(g["mu_max"], 3) if np.isfinite(g["mu_max"]) else None,
+                    "Exceedance times": ", ".join(t for ts in g["times"] for t in ts),
+                    "On the map": "Yes" if g["path"] else "No",
+                }
+                for g in sorted(secs, key=lambda g: -g["n_exc"])
+            ]
+        )
+        st.dataframe(tab, hide_index=True)
+
+
 with tab_cmp, tab_guard("Compare recordings"):
     if len(valid) < 2:
         st.info("Upload two or more recordings to compare them (e.g. before / after a conveyor adjustment).")
@@ -1584,6 +1703,7 @@ with tab_cmp, tab_guard("Compare recordings"):
             st.download_button(
                 "Download comparison (CSV)", cmp_df.to_csv(index=False).encode(), "comparison.csv", "text/csv"
             )
+            render_line_map(list(cmp_df["Recording"]), cmp_df, peaks_map, mu_s)
 
     # ------------------------------------------------------------------ #
     # Compare turntable rotations between recordings
@@ -1842,6 +1962,15 @@ offset is removed so that the speed returns to zero at the stop (zero-velocity u
 offset that MEMS accelerometers show under vibration and slight conveyor slopes. Segments longer than about a
 minute without a stop accumulate error and are flagged *Fair*; segments where the speed turns clearly negative
 are flagged *Poor*.
+
+#### Line layout map (Compare tab)
+
+The plant layout, the conveyor path and the station positions are embedded in the app (generated once from the
+layout with the path drawn in red). Every recording is drawn as the shortest way along the conveyors between the
+stations in its file name (`St<from>-<to>`); `St<station>` is drawn as a ring at the station and a name with *Loop*
+(`St540Loop540`) as the smallest conveyor loop through the station. Where the carrier takes a longer way than the
+shortest one, the stations it passes can be added as *Via* in the sections table. The map tells in which section μs
+is exceeded and how often, not where inside the section.
 
 #### Assumptions and limits
 

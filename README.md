@@ -28,6 +28,9 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   carrier rotation, maximum friction demand and slip.
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings
   (highest required μ per recording, plus every distinct exceedance of μs marked at its peak and counted).
+- Line layout map (Compare tab): the plant layout, the conveyor path and the station positions are embedded in the
+  app. Every recording is drawn along the conveyors between the stations in its file name (`St430-440`, `St989`,
+  `St540 deindex`, `St540Loop540`, `St981-Buffer`), red where μs is exceeded with the number of exceedances.
 - CSV / JSON export of all results.
 - Uploaded files survive a page reload: they are kept in server memory (max. 12 h) under a random id in the page
   URL (`?ws=...`), so reloading after a lost connection restores them.
@@ -54,6 +57,10 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `turns.py` | Turntable / rotation detection and analysis |
 | `motion.py` | Travel direction and motion phase of the carrier |
 | `visuals.py` | Plotly figures and the animated top view |
+| `line_layout.py` | File names → line sections, shortest way along the conveyors, loops |
+| `line_layout_data.py` | Embedded conveyor graph and station table (generated) |
+| `assets/line_layout.png` | Layout background of the line map (generated) |
+| `tools/build_line_layout.py` | Builds the two generated files from `assets/source/line_layout_paths.png` |
 
 ## Coordinate convention
 
@@ -66,3 +73,18 @@ The sensor orientation and position on the workpiece carrier are set in the side
 - At a sample rate of about 10 Hz, short impacts (10–50 ms) are under-sampled and slip is likely underestimated.
   Record at 100 Hz or more when possible.
 - Results are model estimates and should be validated against video and physical measurements.
+
+## Updating the line layout
+
+The map is generated from `assets/source/line_layout_paths.png`: the layout with the conveyor path drawn in red,
+white boxes with a red frame for station names that are hidden on the drawing (e.g. `ST395`), and the light
+grey-blue box with the word *buffer*. Station label positions are listed in `STATION_LABELS` in
+`tools/build_line_layout.py`. After changing either, run (Tesseract is needed to read the boxes):
+
+```bash
+pip install opencv-python-headless scikit-image scipy numpy pillow
+python tools/build_line_layout.py
+```
+
+and commit `line_layout_data.py` and `assets/line_layout.png`.
+
