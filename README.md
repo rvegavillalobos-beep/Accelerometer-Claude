@@ -28,6 +28,10 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   carrier rotation, maximum friction demand and slip.
 - Most critical moments, video synchronisation, friction sensitivity analysis and comparison of several recordings
   (highest required μ per recording, plus every distinct exceedance of μs marked at its peak and counted).
+- Line layout map (Compare tab): upload the plant layout once; station labels are read with OCR, missing ones are
+  placed with one click, and every recording is drawn as the section in its file name (`St430-440`, `St989`,
+  `St981-Buffer`), red where μs is exceeded with the number of exceedances. The layout map is saved as one
+  `.json` file for the next session.
 - CSV / JSON export of all results.
 - Uploaded files survive a page reload: they are kept in server memory (max. 12 h) under a random id in the page
   URL (`?ws=...`), so reloading after a lost connection restores them.
@@ -42,7 +46,9 @@ streamlit run app.py
 ## Deploy on Streamlit Community Cloud
 
 Push the repository to GitHub, create a new app and select `app.py` as the entry point.
-`requirements.txt` is installed automatically.
+`requirements.txt` and `packages.txt` (Tesseract OCR for the line layout map) are installed automatically.
+Locally, install Tesseract with your package manager (e.g. `apt install tesseract-ocr`); without it the layout map
+still works, stations are then placed by hand.
 
 ## Files
 
@@ -52,7 +58,8 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `data_io.py` | WitMotion parser and signal pre-processing |
 | `slip_model.py` | Friction contact model, stick-slip simulation, event extraction |
 | `turns.py` | Turntable / rotation detection and analysis |
-| `motion.py` | Travel direction and motion phase of the carrier |
+| `motion.py` | Travel direction, motion phase and speed profile |
+| `line_map.py` | Layout OCR, station positions and line sections from file names |
 | `visuals.py` | Plotly figures and the animated top view |
 
 ## Coordinate convention
@@ -62,7 +69,7 @@ The sensor orientation and position on the workpiece carrier are set in the side
 
 ## Notes
 
-- Measurement files are not part of this repository. Do not commit plant data to a public repository.
+- Measurement files and plant layouts are not part of this repository. Do not commit plant data to a public repository.
 - At a sample rate of about 10 Hz, short impacts (10–50 ms) are under-sampled and slip is likely underestimated.
   Record at 100 Hz or more when possible.
 - Results are model estimates and should be validated against video and physical measurements.

@@ -11,6 +11,7 @@ venv/
 # Measurement data and videos: plant data must not be published
 *.txt
 !requirements.txt
+!packages.txt
 *.csv
 *.tsv
 *.log
@@ -19,3 +20,12 @@ venv/
 *.m4v
 *.webm
 data/
+
+# Plant layouts and saved layout maps (contain the layout image)
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*layout_map*.json
