@@ -756,15 +756,15 @@ with st.sidebar:
             "horizontal, 1 g vertical) is removed, however long. Use it only above the largest real impact.",
         )
         spike_min_total = st.number_input(
-            "Dropout: total acceleration below [g]",
+            "Dropout: vertical below [g]",
             value=0.3,
             min_value=0.0,
             max_value=0.9,
             step=0.05,
             disabled=spike_mode == "off",
-            help="On a conveyor the sensor always measures gravity (about 1 g in total). A sample whose total "
-            "acceleration is far below that is a dropped or zero data packet and is removed, however long. "
-            "0 = off.",
+            help="A carrier cannot fall faster than gravity: the vertical acceleration stays near 1 g (real bumps "
+            "reach about 0.7 g). A sample with a vertical reading below this value (zero, dropped or inverted data "
+            "packet) is removed, however long. 0 = off.",
         )
 
     with st.expander("4 · Cell cluster", expanded=True):
@@ -938,7 +938,7 @@ pre = asdict(
         spike_gyro_dps=float(spike_gyro),
         spike_max_width=int(spike_width),
         spike_limit_g=float(spike_limit),
-        spike_min_total_g=float(spike_min_total),
+        spike_min_vertical_g=float(spike_min_total),
     )
 )
 cluster_d = asdict(
@@ -2338,8 +2338,8 @@ A sample is treated as a glitch when it differs from the median of its neighbour
 than the jump threshold (0.5 g for accelerations, 15 deg/s for the yaw rate by default), the deviation lasts at most
 w samples (1 by default; 5 ms at 200 Hz) and the neighbours sit at the normal level of the signal (median over about
 0.2 s). Around the peak of a real impact the neighbouring samples are raised as well, so the peak is kept. A sample
-whose total acceleration is below 0.3 g is a dropped or zero data packet (the sensor always measures gravity on a
-conveyor) and is removed whatever its width. Each glitch sample is replaced by linear interpolation in all channels,
+whose vertical acceleration is below 0.3 g is a dropped, zero or inverted data packet (a carrier cannot fall faster
+than gravity; real bumps reach about 0.7 g) and is removed whatever its width. Each glitch sample is replaced by linear interpolation in all channels,
 because the data packet is corrupt. The optional hard limit removes every acceleration sample farther than the limit
 from its typical value, whatever its duration. In Auto mode the filter runs only from 50 Hz on: at 10 Hz a real impact
 can be a single sample.

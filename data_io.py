@@ -189,8 +189,8 @@ class PreprocessSettings:
     spike_gyro_dps: float = 15.0  # same for the yaw rate [deg/s]
     spike_max_width: int = 1  # samples; wider events are kept (real impacts last several samples)
     spike_limit_g: float = 0.0  # 0 = off; acceleration samples farther than this from the typical value are removed
-    spike_min_total_g: float = 0.3  # 0 = off; total acceleration below this is impossible on a conveyor (the sensor
-    # always reads gravity): dropped / zero data packets, removed whatever their width
+    spike_min_vertical_g: float = 0.3  # 0 = off; a vertical acceleration below this is impossible on a conveyor (the
+    # carrier cannot fall faster than gravity): dropped, zero or inverted data packets, removed whatever their width
 
 
 @dataclass
@@ -323,15 +323,16 @@ def remove_spikes(t: np.ndarray, ch: dict[str, np.ndarray], s: PreprocessSetting
             if i not in best or score > best[i][0]:
                 best[i] = (score, label, float(xs[i]), float(med[i]))
         union |= m
-    if s.spike_min_total_g > 0:  # dropped / zero packets: the sensor always measures gravity on a conveyor
-        total = np.sqrt(ch["ax"] ** 2 + ch["ay"] ** 2 + ch["az"] ** 2)
-        low = total < s.spike_min_total_g
+    if s.spike_min_vertical_g > 0:  # dropped / zero / inverted packets: a carrier cannot fall faster than gravity
+        up = 1.0 if np.median(ch["az"]) >= 0 else -1.0  # sensor mounted upside down: vertical reads -1 g at rest
+        vert = up * ch["az"]
+        low = vert < s.spike_min_vertical_g
         if low.any():
-            ref = float(np.median(total))
+            ref = float(np.median(ch["az"]))
             for i in np.where(low)[0]:
-                score = 1e3 + (s.spike_min_total_g - total[i])  # always reported as a dropout
+                score = 1e3 + (s.spike_min_vertical_g - vert[i])  # always reported as a dropout
                 if i not in best or score > best[i][0]:
-                    best[i] = (score, "Total acceleration (dropout)", float(total[i]), ref)
+                    best[i] = (score, "Acceleration Z (dropout)", float(ch["az"][i]), ref)
             union |= low
     keep = ~union
     if not union.any() or keep.sum() < 2:
