@@ -185,10 +185,12 @@ class PreprocessSettings:
     t_end: float | None = None
     # Spike filter: isolated samples far from their neighbours (transmission glitches) are replaced by interpolation
     spike_mode: str = "auto"  # "auto" (on from 50 Hz native rate) | "on" | "off"
-    spike_acc_g: float = 1.0  # jump of an acceleration sample away from its neighbours that counts as a glitch [g]
-    spike_gyro_dps: float = 30.0  # same for the yaw rate [deg/s]
+    spike_acc_g: float = 0.5  # jump of an acceleration sample away from its neighbours that counts as a glitch [g]
+    spike_gyro_dps: float = 15.0  # same for the yaw rate [deg/s]
     spike_max_width: int = 1  # samples; wider events are kept (real impacts last several samples)
     spike_limit_g: float = 0.0  # 0 = off; acceleration samples farther than this from the typical value are removed
+    spike_min_total_g: float = 0.3  # 0 = off; total acceleration below this is impossible on a conveyor (the sensor
+    # always reads gravity): dropped / zero data packets, removed whatever their width
 
 
 @dataclass
@@ -278,18 +280,25 @@ SPIKE_CHANNELS = (("ax", "Acceleration X"), ("ay", "Acceleration Y"), ("az", "Ac
 
 def find_spikes(x: np.ndarray, threshold: float, max_width: int = 1) -> tuple[np.ndarray, np.ndarray]:
     """Isolated glitches: runs of at most max_width samples that jump more than threshold away from the median of
-    their neighbours and come back. Returns (mask, neighbour median). Wider events (real impacts) are kept."""
+    their neighbours and come back, while the neighbours themselves sit at the normal level of the signal.
+
+    The last condition separates a glitch from the sharp peak of a real impact: around a real peak the neighbouring
+    samples are raised as well (the impact builds up and dies away), around a glitch they are not.
+    Returns (mask, neighbour median). Wider events (real impacts) are kept."""
     n = len(x)
-    med = median_filter(x, size=2 * max(1, int(max_width)) + 3, mode="nearest") if n else x
+    w = max(1, int(max_width))
+    med = median_filter(x, size=2 * w + 3, mode="nearest") if n else x
     mask = np.zeros(n, bool)
     if n < 5 or threshold <= 0:
         return mask, med
-    cand = np.abs(x - med) > threshold
+    dev = np.abs(x - med)
+    base = median_filter(x, size=max(31, 8 * (2 * w + 3) + 1), mode="nearest")  # normal level, ~0.2 s at 150 Hz
+    cand = (dev > threshold) & (np.abs(med - base) < 0.5 * dev)
     if not cand.any():
         return mask, med
     edges = np.diff(np.r_[0, cand.astype(np.int8), 0])
     for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
-        if b - a <= max_width:
+        if b - a <= w:
             mask[a:b] = True
     return mask, med
 
@@ -314,6 +323,16 @@ def remove_spikes(t: np.ndarray, ch: dict[str, np.ndarray], s: PreprocessSetting
             if i not in best or score > best[i][0]:
                 best[i] = (score, label, float(xs[i]), float(med[i]))
         union |= m
+    if s.spike_min_total_g > 0:  # dropped / zero packets: the sensor always measures gravity on a conveyor
+        total = np.sqrt(ch["ax"] ** 2 + ch["ay"] ** 2 + ch["az"] ** 2)
+        low = total < s.spike_min_total_g
+        if low.any():
+            ref = float(np.median(total))
+            for i in np.where(low)[0]:
+                score = 1e3 + (s.spike_min_total_g - total[i])  # always reported as a dropout
+                if i not in best or score > best[i][0]:
+                    best[i] = (score, "Total acceleration (dropout)", float(total[i]), ref)
+            union |= low
     keep = ~union
     if not union.any() or keep.sum() < 2:
         return []
@@ -350,7 +369,9 @@ def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
         spikes = remove_spikes(t_native, ch, s)
         ax, ay, az, wz = ch["ax"], ch["ay"], ch["az"], ch["wz"]
         if spikes:
-            worst = max(spikes, key=lambda r: abs(r[2] - r[3]) / (s.spike_gyro_dps if r[1] == "Yaw rate" else s.spike_acc_g))
+            worst = max(
+                spikes, key=lambda r: abs(r[2] - r[3]) / (s.spike_gyro_dps if r[1] == "Yaw rate" else max(s.spike_acc_g, 0.1))
+            )
             unit = "deg/s" if worst[1] == "Yaw rate" else "g"
             warnings.append(
                 f"{len(spikes)} isolated spike(s) removed by the spike filter (largest: {worst[1].lower()} "

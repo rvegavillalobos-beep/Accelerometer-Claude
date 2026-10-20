@@ -720,16 +720,17 @@ with st.sidebar:
         sp1, sp2 = st.columns(2)
         spike_acc = sp1.number_input(
             "Jump [g]",
-            value=1.0,
+            value=0.5,
             min_value=0.1,
             max_value=10.0,
             step=0.1,
             disabled=spike_mode == "off",
-            help="Acceleration sample this far from the median of its neighbours = glitch.",
+            help="Acceleration sample this far from the median of its neighbours = glitch, if the neighbours sit at the "
+            "normal level of the signal (around the peak of a real impact they are raised too, so it is kept).",
         )
         spike_gyro = sp2.number_input(
             "Jump [deg/s]",
-            value=30.0,
+            value=15.0,
             min_value=1.0,
             max_value=1000.0,
             step=5.0,
@@ -753,6 +754,17 @@ with st.sidebar:
             disabled=spike_mode == "off",
             help="Optional (0 = off): any acceleration sample farther than this from its typical value (≈0 g "
             "horizontal, 1 g vertical) is removed, however long. Use it only above the largest real impact.",
+        )
+        spike_min_total = st.number_input(
+            "Dropout: total acceleration below [g]",
+            value=0.3,
+            min_value=0.0,
+            max_value=0.9,
+            step=0.05,
+            disabled=spike_mode == "off",
+            help="On a conveyor the sensor always measures gravity (about 1 g in total). A sample whose total "
+            "acceleration is far below that is a dropped or zero data packet and is removed, however long. "
+            "0 = off.",
         )
 
     with st.expander("4 · Cell cluster", expanded=True):
@@ -926,6 +938,7 @@ pre = asdict(
         spike_gyro_dps=float(spike_gyro),
         spike_max_width=int(spike_width),
         spike_limit_g=float(spike_limit),
+        spike_min_total_g=float(spike_min_total),
     )
 )
 cluster_d = asdict(
@@ -2322,11 +2335,14 @@ not uniform — a region with higher friction stays put and the rest of the clus
 
 Bluetooth transmission errors produce isolated samples far away from the real signal (a single sample of several g).
 A sample is treated as a glitch when it differs from the median of its neighbours (window of 2·w + 3 samples) by more
-than the jump threshold (1 g for accelerations, 30 deg/s for the yaw rate by default) and the deviation lasts at most
-w samples (1 by default; 5 ms at 200 Hz). The whole sample is then replaced by linear interpolation, because the
-data packet is corrupt. A real impact lasts several samples at high sample rates and is kept. The optional hard limit
-removes every acceleration sample farther than the limit from its typical value, whatever its duration. In Auto mode
-the filter runs only from 50 Hz on: at 10 Hz a real impact can be a single sample.
+than the jump threshold (0.5 g for accelerations, 15 deg/s for the yaw rate by default), the deviation lasts at most
+w samples (1 by default; 5 ms at 200 Hz) and the neighbours sit at the normal level of the signal (median over about
+0.2 s). Around the peak of a real impact the neighbouring samples are raised as well, so the peak is kept. A sample
+whose total acceleration is below 0.3 g is a dropped or zero data packet (the sensor always measures gravity on a
+conveyor) and is removed whatever its width. Each glitch sample is replaced by linear interpolation in all channels,
+because the data packet is corrupt. The optional hard limit removes every acceleration sample farther than the limit
+from its typical value, whatever its duration. In Auto mode the filter runs only from 50 Hz on: at 10 Hz a real impact
+can be a single sample.
 
 #### Turntable detection
 
