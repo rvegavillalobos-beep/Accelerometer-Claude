@@ -706,6 +706,54 @@ with st.sidebar:
             step=0.05,
             help="Savitzky-Golay window used to differentiate the yaw rate.",
         )
+        st.markdown("**Spike filter** (transmission glitches)")
+        spike_mode_lbl = st.selectbox(
+            "Remove isolated spikes",
+            ["Auto (from 50 Hz)", "On", "Off"],
+            index=0,
+            help="A glitch is a sample that jumps far away from its neighbours and comes straight back (typically one "
+            "sample, up to several g). It is replaced by interpolation. Real impacts last several samples at "
+            "high sample rates and are kept. Auto: on when the native rate is 50 Hz or more; at 10 Hz a real "
+            "impact can be a single sample.",
+        )
+        spike_mode = {"Auto (from 50 Hz)": "auto", "On": "on", "Off": "off"}[spike_mode_lbl]
+        sp1, sp2 = st.columns(2)
+        spike_acc = sp1.number_input(
+            "Jump [g]",
+            value=1.0,
+            min_value=0.1,
+            max_value=10.0,
+            step=0.1,
+            disabled=spike_mode == "off",
+            help="Acceleration sample this far from the median of its neighbours = glitch.",
+        )
+        spike_gyro = sp2.number_input(
+            "Jump [deg/s]",
+            value=30.0,
+            min_value=1.0,
+            max_value=1000.0,
+            step=5.0,
+            disabled=spike_mode == "off",
+            help="Same for the yaw rate.",
+        )
+        sp3, sp4 = st.columns(2)
+        spike_width = sp3.select_slider(
+            "Max. width [samples]",
+            [1, 2, 3],
+            value=1,
+            disabled=spike_mode == "off",
+            help="Wider events are kept as real. At 200 Hz one sample is 5 ms.",
+        )
+        spike_limit = sp4.number_input(
+            "Hard limit [g]",
+            value=0.0,
+            min_value=0.0,
+            max_value=20.0,
+            step=0.5,
+            disabled=spike_mode == "off",
+            help="Optional (0 = off): any acceleration sample farther than this from its typical value (≈0 g "
+            "horizontal, 1 g vertical) is removed, however long. Use it only above the largest real impact.",
+        )
 
     with st.expander("4 · Cell cluster", expanded=True):
         mass = st.number_input("Mass [kg]", value=400.0, min_value=1.0, step=10.0)
@@ -873,6 +921,11 @@ pre = asdict(
         alpha_window_s=float(alpha_win),
         t_start=float(win[0]),
         t_end=float(win[1]),
+        spike_mode=spike_mode,
+        spike_acc_g=float(spike_acc),
+        spike_gyro_dps=float(spike_gyro),
+        spike_max_width=int(spike_width),
+        spike_limit_g=float(spike_limit),
     )
 )
 cluster_d = asdict(
@@ -1783,6 +1836,32 @@ with tab_anim, tab_guard("Top-view animation"):
 # --------------------------------------------------------------------------- #
 with tab_sig, tab_guard("Signals"):
     st.plotly_chart(fig_kinematics(kin, res), config=PLOT_CONFIG, key="sig_kin")
+    spikes_ = getattr(kin, "spikes", []) or []
+    if spikes_:
+        with st.expander(f"Spikes removed by the spike filter ({len(spikes_)})", expanded=False):
+            c0 = pd.Timestamp(raw.df["clock"].iloc[0])
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Time [s]": round(t_, 3),
+                            "Clock": fmt_clock(c0 + pd.to_timedelta(t_, unit="s")),
+                            "Channel (sensor axes)": ch_,
+                            "Value": v_,
+                            "Neighbours": n_,
+                            "Unit": "deg/s" if ch_ == "Yaw rate" else "g",
+                        }
+                        for t_, ch_, v_, n_ in spikes_
+                    ]
+                ),
+                hide_index=True,
+            )
+            st.caption(
+                "Each of these samples was replaced (all channels) by interpolation between its neighbours before the "
+                "simulation. Change the thresholds under Signal processing → Spike filter in the sidebar."
+            )
+    elif spike_mode == "on" or (spike_mode == "auto" and kin.fs_native >= 50):
+        st.caption("Spike filter on: no isolated spikes found in this recording.")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("##### Recording diagnostics")
@@ -2238,6 +2317,16 @@ centroid, so a linear acceleration produces almost pure sliding. Rotation appear
 rotates (turntables, yaw acceleration), (b) the load is concentrated on some supports, or (c) the friction is
 not uniform — a region with higher friction stays put and the rest of the cluster swings around it. Options
 (b) and (c) can be set in the sidebar to reproduce the observed behaviour.
+
+#### Spike filter
+
+Bluetooth transmission errors produce isolated samples far away from the real signal (a single sample of several g).
+A sample is treated as a glitch when it differs from the median of its neighbours (window of 2·w + 3 samples) by more
+than the jump threshold (1 g for accelerations, 30 deg/s for the yaw rate by default) and the deviation lasts at most
+w samples (1 by default; 5 ms at 200 Hz). The whole sample is then replaced by linear interpolation, because the
+data packet is corrupt. A real impact lasts several samples at high sample rates and is kept. The optional hard limit
+removes every acceleration sample farther than the limit from its typical value, whatever its duration. In Auto mode
+the filter runs only from 50 Hz on: at 10 Hz a real impact can be a single sample.
 
 #### Turntable detection
 

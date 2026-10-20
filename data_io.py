@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import median_filter
 from scipy.signal import butter, savgol_filter, sosfiltfilt
 
 G0 = 9.80665  # standard gravity [m/s^2]
@@ -182,6 +183,12 @@ class PreprocessSettings:
     gap_factor: float = 3.0  # a gap is flagged when dt > gap_factor * nominal period
     t_start: float | None = None  # analysis window [s from recording start]
     t_end: float | None = None
+    # Spike filter: isolated samples far from their neighbours (transmission glitches) are replaced by interpolation
+    spike_mode: str = "auto"  # "auto" (on from 50 Hz native rate) | "on" | "off"
+    spike_acc_g: float = 1.0  # jump of an acceleration sample away from its neighbours that counts as a glitch [g]
+    spike_gyro_dps: float = 30.0  # same for the yaw rate [deg/s]
+    spike_max_width: int = 1  # samples; wider events are kept (real impacts last several samples)
+    spike_limit_g: float = 0.0  # 0 = off; acceleration samples farther than this from the typical value are removed
 
 
 @dataclass
@@ -203,6 +210,7 @@ class Kinematics:
     bias: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     t_native: np.ndarray = field(default_factory=lambda: np.zeros(0))  # native sample times inside the window [s]
+    spikes: list = field(default_factory=list)  # removed glitches: (t [s], channel, value, value of the neighbours)
 
     @property
     def dt(self) -> float:
@@ -265,6 +273,55 @@ def recording_duration(raw: RawRecording) -> float:
     return float((c.iloc[-1] - c.iloc[0]).total_seconds())
 
 
+SPIKE_CHANNELS = (("ax", "Acceleration X"), ("ay", "Acceleration Y"), ("az", "Acceleration Z"), ("wz", "Yaw rate"))
+
+
+def find_spikes(x: np.ndarray, threshold: float, max_width: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Isolated glitches: runs of at most max_width samples that jump more than threshold away from the median of
+    their neighbours and come back. Returns (mask, neighbour median). Wider events (real impacts) are kept."""
+    n = len(x)
+    med = median_filter(x, size=2 * max(1, int(max_width)) + 3, mode="nearest") if n else x
+    mask = np.zeros(n, bool)
+    if n < 5 or threshold <= 0:
+        return mask, med
+    cand = np.abs(x - med) > threshold
+    if not cand.any():
+        return mask, med
+    edges = np.diff(np.r_[0, cand.astype(np.int8), 0])
+    for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
+        if b - a <= max_width:
+            mask[a:b] = True
+    return mask, med
+
+
+def remove_spikes(t: np.ndarray, ch: dict[str, np.ndarray], s: PreprocessSettings) -> list:
+    """Replace isolated glitches in place by linear interpolation. The whole sample (all channels) is replaced:
+    a glitch is a corrupted data packet. Returns (t [s], channel, value, value of the neighbours) per glitch."""
+    union = np.zeros(len(t), bool)
+    best: dict[int, tuple] = {}  # sample -> (score, channel, value, neighbours)
+    for key, label in SPIKE_CHANNELS:
+        gyro = key == "wz"
+        xs = np.rad2deg(ch[key]) if gyro else ch[key]  # yaw rate in deg/s, accelerations in g
+        thr = s.spike_gyro_dps if gyro else s.spike_acc_g
+        m, med = find_spikes(xs, thr, s.spike_max_width)
+        if s.spike_limit_g > 0 and not gyro:  # hard limit: far from the typical value, whatever the width
+            ref = float(np.median(xs))
+            hard = np.abs(xs - ref) > s.spike_limit_g
+            med = np.where(hard & (np.abs(med - ref) > s.spike_limit_g), ref, med)
+            m = m | hard
+        for i in np.where(m)[0]:
+            score = abs(xs[i] - med[i]) / max(thr if thr > 0 else s.spike_limit_g, 1e-9)
+            if i not in best or score > best[i][0]:
+                best[i] = (score, label, float(xs[i]), float(med[i]))
+        union |= m
+    keep = ~union
+    if not union.any() or keep.sum() < 2:
+        return []
+    for key, _label in SPIKE_CHANNELS:
+        ch[key][union] = np.interp(t[union], t[keep], ch[key][keep])
+    return [(round(float(t[i]), 4), best[i][1], round(best[i][2], 3), round(best[i][3], 3)) for i in sorted(best)]
+
+
 def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
     """Convert a raw recording into uniformly sampled carrier kinematics."""
     df = raw.df
@@ -273,9 +330,9 @@ def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
     t_native = _retime(df["clock"], s.timestamp_mode)
     clock0 = df["clock"].iloc[0]
 
-    ax = df["ax"].to_numpy(float)
-    ay = df["ay"].to_numpy(float)
-    az = df["az"].to_numpy(float)
+    ax = df["ax"].to_numpy(float, copy=True)
+    ay = df["ay"].to_numpy(float, copy=True)
+    az = df["az"].to_numpy(float, copy=True)
     wz = np.deg2rad(df["wz"].to_numpy(float))
 
     # Fill isolated NaNs
@@ -283,6 +340,22 @@ def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
         bad = ~np.isfinite(arr)
         if bad.any():
             arr[bad] = np.interp(t_native[bad], t_native[~bad], arr[~bad])
+
+    # --- Spike filter (transmission glitches: single samples far away from their neighbours)
+    spikes: list = []
+    dtn = np.diff(t_native)
+    fs_est = 1.0 / float(np.median(dtn)) if len(dtn) and np.median(dtn) > 0 else 0.0
+    if s.spike_mode == "on" or (s.spike_mode == "auto" and fs_est >= 50.0):
+        ch = {"ax": ax, "ay": ay, "az": az, "wz": wz}
+        spikes = remove_spikes(t_native, ch, s)
+        ax, ay, az, wz = ch["ax"], ch["ay"], ch["az"], ch["wz"]
+        if spikes:
+            worst = max(spikes, key=lambda r: abs(r[2] - r[3]) / (s.spike_gyro_dps if r[1] == "Yaw rate" else s.spike_acc_g))
+            unit = "deg/s" if worst[1] == "Yaw rate" else "g"
+            warnings.append(
+                f"{len(spikes)} isolated spike(s) removed by the spike filter (largest: {worst[1].lower()} "
+                f"{worst[2]:.2f} {unit} where its neighbours read {worst[3]:.2f} {unit}). See the Signals tab."
+            )
 
     # --- Mounting: upside-down detection (rotation of 180 deg about sensor X)
     flipped = False
@@ -401,6 +474,7 @@ def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
         bias=bias,
         warnings=warnings,
         t_native=t_native[(t_native >= t0) & (t_native <= t1)],
+        spikes=spikes,
     )
 
 

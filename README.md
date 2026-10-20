@@ -8,6 +8,9 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
 ## Features
 
 - Reads WitMotion tab-separated exports (Bluetooth timestamp jitter, duplicate packets and sensor offset handled).
+- Spike filter: isolated transmission glitches (a single sample of several g, typical at high sample rates) are
+  detected against the median of the neighbouring samples and replaced by interpolation; real impacts, which last
+  several samples, are kept. Optional hard limit in g. The removed samples are listed in the Signals tab.
 - Transfers the carrier motion to the cluster centre, including turntable rotations (centripetal and tangential terms).
 - Planar stick-slip model with a distributed Coulomb friction contact (full-area or four corner supports,
   optional non-uniform friction per corner region).
