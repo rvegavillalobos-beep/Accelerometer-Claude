@@ -795,6 +795,28 @@ with st.sidebar:
         if mu_k > mu_s:
             st.warning("μk is higher than μs; μk will be limited to μs.")
             mu_k = mu_s
+        limit_lbl = st.radio(
+            "Friction limit",
+            ["Dynamic (drops with the vertical acceleration)", "Fixed (μs)"],
+            help="Dynamic: the friction available is μs × vertical acceleration, so a bump or drop (vertical below 1 g) "
+            "lowers it. It only ever counts against you: a vertical acceleration above 1 g does not raise it. "
+            "Fixed: the friction available is always μs, the vertical acceleration is ignored. The simulation, "
+            "the slip events and all charts use the chosen limit.",
+        )
+        limit_mode = "fixed" if limit_lbl.startswith("Fixed") else "dynamic"
+        limit_smooth_ms = st.number_input(
+            "Smoothing of the dynamic limit [ms]",
+            value=20,
+            min_value=0,
+            max_value=200,
+            step=10,
+            disabled=limit_mode == "fixed",
+            help="Removes the vibration from the dynamic limit without ever raising it: lower envelope (moving "
+            "minimum) followed by a moving average of the same window. At every sample the smoothed limit is at or "
+            "below the unsmoothed one, so no dip is lost or made shallower; dips only get wider by half the window. "
+            "The price: the smooth curve follows the bottom of the vibration, slightly lower (more pessimistic). "
+            "0 = off.",
+        )
         model_label = st.radio(
             "Contact layout",
             ["Full-area contact", "Four corner supports"],
@@ -958,6 +980,8 @@ contact_d = asdict(
         nx=nx,
         ny=ny,
         corner_mu_factors=mu_fac,
+        normal_mode=limit_mode,
+        normal_smooth_s=float(limit_smooth_ms) / 1000.0,
     )
 )
 sensor_d = asdict(SensorGeometry(x=float(sx), y=float(sy)))
@@ -1163,15 +1187,21 @@ k3.metric(
 k4.metric("Final rotation", f"{sm['final_rot_deg']:.3f}°")
 k5, k6, k7, k8 = st.columns(4)
 k5.metric("Peak horizontal accel. at CoM", f"{sm['peak_fh_g']:.3f} g")
+_lim_factor = float(sm.get("min_limit_factor", max(sm["min_fz_g"], 0.0)))
 k6.metric(
-    "Lowest dynamic friction limit",
-    f"{mu_s * max(sm['min_fz_g'], 0.0):.3f} g",
-    f"{(max(sm['min_fz_g'], 0.0) - 1) * 100:+.0f}% vs static",
+    "Lowest friction limit" if limit_mode == "dynamic" else "Friction limit (fixed)",
+    f"{mu_s * _lim_factor:.3f} g",
+    f"{(_lim_factor - 1) * 100:+.0f}% vs static" if limit_mode == "dynamic" else None,
     delta_color="normal",
     help=(
-        "Highest horizontal acceleration the cluster can take without sliding = μs × vertical acceleration. "
-        f"At rest it equals μs ({mu_s:.3f} g); the minimum vertical acceleration in this record is "
-        f"{sm['min_fz_g']:.3f} g."
+        "Highest horizontal acceleration the cluster can take without sliding. "
+        + (
+            f"Dynamic: μs × vertical acceleration (never above μs = {mu_s:.3f} g"
+            + (f", smoothed over {limit_smooth_ms} ms" if limit_smooth_ms else "")
+            + f"); the minimum vertical acceleration in this record is {sm['min_fz_g']:.3f} g."
+            if limit_mode == "dynamic"
+            else f"Fixed: always μs = {mu_s:.3f} g (vertical acceleration ignored)."
+        )
     ),
 )
 k7.metric(
@@ -1676,8 +1706,9 @@ with tab_turn, tab_guard("Turntables"):
         st.plotly_chart(fig_turn_detail(kin, res, w0, w1), config=PLOT_CONFIG, key="tt_detail")
         st.caption(
             "Friction demand = required μ × vertical acceleration: the friction the cluster needs, including the "
-            "turntable rotational load, expressed in g. Dynamic friction limit = μs × vertical acceleration: the "
-            "friction available, which drops on bumps. Where the blue curve reaches the red one, the cluster slips."
+            "turntable rotational load, expressed in g. Friction limit (red) = the friction available: μs, or with "
+            "the dynamic limit μs × vertical acceleration, which drops on bumps (sidebar → Friction contact). Where "
+            "the blue curve reaches the red one, the cluster slips."
         )
 
 # --------------------------------------------------------------------------- #
@@ -1705,14 +1736,14 @@ with tab_speed, tab_guard("Speed profile"):
     c4.metric(
         "Highest braking deceleration",
         f"{good_tab['Peak deceleration [g]'].max():.3f} g" if len(good_tab) else "-",
-        help="Includes stopper impacts. Compare with the dynamic friction limit μs·f_z.",
+        help="Includes stopper impacts. Compare with the friction limit (chart below).",
     )
     st.plotly_chart(
         fig_speed_timeline(kin, res, travel_speed, speed_q, rotations), config=PLOT_CONFIG, key="sp_timeline"
     )
     st.caption(
         "Middle chart: same friction demand as in the Turntables tab (translation + rotation, in g) against the "
-        "dynamic friction limit μs·f_z, which drops when the vertical acceleration drops. Where the demand reaches "
+        "friction limit (fixed μs, or dynamic: drops when the vertical acceleration drops). Where the demand reaches "
         "the limit the cluster slides; read it together with the speed above to see whether a start ramp, a stop, "
         "a stopper impact or a turntable causes it."
     )
@@ -2180,7 +2211,7 @@ with tab_cmp, tab_guard("Compare recordings"):
     st.markdown("##### Compare turntable rotations")
     st.caption(
         "Pick a turn in one recording and a turn in another (or in the same) recording. The curves are aligned "
-        "at the chosen point and overlaid: yaw rate, friction demand against the dynamic friction limit, and yaw "
+        "at the chosen point and overlaid: yaw rate, friction demand against the friction limit, and yaw "
         "acceleration."
     )
     rec_names = list(valid.keys())
@@ -2259,7 +2290,7 @@ with tab_cmp, tab_guard("Compare recordings"):
                     "Slow / creep phase [deg]": tt_x["Slow / creep phase [deg]"],
                     "Max demand · rotation [g]": round(float(np.nanmax(demand[rot_m])), 3) if rot_m.any() else np.nan,
                     "Max demand · window [g]": round(float(np.nanmax(demand[around])), 3) if around.any() else np.nan,
-                    "Lowest dynamic limit [g]": round(float(np.nanmin(limit[around])), 3) if around.any() else np.nan,
+                    "Lowest friction limit [g]": round(float(np.nanmin(limit[around])), 3) if around.any() else np.nan,
                     "Required mu · entry": tt_x["Required mu · entry"],
                     "Required mu · rotation": tt_x["Required mu · rotation"],
                     "Required mu · exit": tt_x["Required mu · exit"],
@@ -2270,7 +2301,8 @@ with tab_cmp, tab_guard("Compare recordings"):
         st.dataframe(pd.DataFrame(table_rows).set_index("").T, use_container_width=True)
         st.caption(
             "Friction demand = required μ × vertical acceleration (translation and turntable rotation), in g. "
-            "Dynamic limit = μs × vertical acceleration. Where a demand curve reaches its limit, that cluster slips."
+            "Limit = μs (fixed) or μs × vertical acceleration (dynamic). Where a demand curve reaches its limit, that "
+            "cluster slips."
         )
 
 # --------------------------------------------------------------------------- #
@@ -2371,7 +2403,13 @@ occurred while the carrier was accelerating, braking / stopping, or as a lateral
 
 The friction force available is μs·N and the normal load N = m·g₀·f_z follows the vertical acceleration. The
 largest horizontal acceleration the cluster can take is therefore μs·f_z (in g): at rest it equals μs, during a
-bump to 0.7 g it is 30 % lower. The column *Z effect on demand* in the critical moments shows how much the
+bump to 0.7 g it is 30 % lower. The limit is chosen in the sidebar (Friction contact) and used by the simulation and
+all charts: *Fixed* = μs (vertical acceleration ignored); *Dynamic* = μs·min(f_z, 1), so it only ever counts against
+the cluster: a vertical acceleration above 1 g does not raise it. The dynamic limit can be smoothed without ever being
+raised: moving minimum (lower envelope) over the window, then a moving average over the same odd window. Every
+averaged value comes from minima whose windows contain the current sample, so the smoothed limit is at or below the
+unsmoothed one at every sample; dips keep their full depth and only widen by half the window. Because the smooth
+curve follows the bottom of the vibration it is slightly lower than the mean, i.e. more pessimistic. The column *Z effect on demand* in the critical moments shows how much the
 vertical acceleration raised the required μ at that instant. The **kinetic** friction coefficient μk cannot be
 derived from the carrier sensor: it only acts while the cluster slides. Measure it with a pull test (steady
 force while sliding ÷ weight) or with a second sensor on the cluster.

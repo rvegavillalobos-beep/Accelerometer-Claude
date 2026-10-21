@@ -41,6 +41,7 @@ import os as _os
 
 _LOADED_MTIME = _os.path.getmtime(__file__)  # used by app.py to detect stale modules
 
+import dataclasses
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -89,6 +90,10 @@ class ContactParams:
         1.0,
         1.0,
     )  # friction multiplier per corner region FL, FR, RR, RL
+    # Friction limit: "dynamic" = the normal force follows the vertical acceleration, but only downwards (a bump
+    # or drop lowers the limit, a vertical acceleration above 1 g never raises it); "fixed" = normal force m·g.
+    normal_mode: str = "dynamic"
+    normal_smooth_s: float = 0.02  # dynamic: smoothing window [s] that never raises the limit (0 = off)
 
 
 @dataclass(frozen=True)
@@ -265,6 +270,8 @@ class SimulationResult:
     events: pd.DataFrame
     runtime_s: float = 0.0
     truncated: bool = False
+    fz_eff: np.ndarray = field(default_factory=lambda: np.zeros(0))  # vertical factor used for the normal force
+
 
     @property
     def max_corner_disp(self) -> np.ndarray:
@@ -274,6 +281,36 @@ class SimulationResult:
 def _rot(phi: float) -> np.ndarray:
     c, s = np.cos(phi), np.sin(phi)
     return np.array([[c, -s], [s, c]])
+
+
+def effective_vertical(fz: np.ndarray, fs: float, mode: str = "dynamic", smooth_s: float = 0.0) -> np.ndarray:
+    """Vertical factor of the normal force N = m·g·factor (1 at rest).
+
+    fixed:   1 everywhere (friction limit μs·m·g).
+    dynamic: min(f_z, 1) - the vertical acceleration only ever lowers the limit. Optional smoothing over smooth_s:
+             lower envelope (moving minimum) followed by a moving average of the same, odd, window. Every averaged
+             value comes from minima whose windows contain the current sample, so the result is never above
+             min(f_z, 1) at any sample: every dip is kept at least as deep (only widened by half the window), the
+             noise between dips is smoothed away. It can make the result more pessimistic, never less."""
+    from scipy.ndimage import minimum_filter1d, uniform_filter1d
+
+    if mode == "fixed":
+        return np.ones_like(fz, dtype=float)
+    f = np.minimum(np.clip(np.asarray(fz, dtype=float), 0.0, None), 1.0)
+    w = int(round(float(smooth_s) * float(fs)))
+    if w >= 2 and len(f) > w:
+        w += 1 - w % 2  # odd window: centred and symmetric
+        env = minimum_filter1d(f, size=w, mode="nearest")
+        f = np.minimum(uniform_filter1d(env, size=w, mode="nearest"), f)  # min() only guards rounding
+    return f
+
+
+def vertical_factor(res: "SimulationResult", kin: Kinematics) -> np.ndarray:
+    """Vertical factor used by the simulation (falls back to the raw vertical acceleration for old results)."""
+    fe = getattr(res, "fz_eff", None)
+    if fe is not None and len(fe) == len(kin.fz):
+        return fe
+    return np.clip(kin.fz, 0.0, None)
 
 
 def simulate(
@@ -297,8 +334,9 @@ def simulate(
 
     t = kin.t
     T = len(t)
-    fx, fy, fz, wz, al = kin.fx, kin.fy, kin.fz, kin.wz, kin.alpha
-    normal = m * G0 * np.clip(fz, 0.0, None)
+    fx, fy, wz, al = kin.fx, kin.fy, kin.wz, kin.alpha
+    fz_eff = effective_vertical(kin.fz, kin.fs, contact.normal_mode, contact.normal_smooth_s)
+    normal = m * G0 * np.clip(fz_eff, 0.0, None)
 
     # outputs
     ux = np.zeros(T)
@@ -534,6 +572,7 @@ def simulate(
         sensor=sensor,
         events=pd.DataFrame(),
         truncated=truncated,
+        fz_eff=fz_eff,
     )
     res.events = extract_events(res, kin)
     res.runtime_s = time.perf_counter() - t_start_wall
@@ -671,6 +710,7 @@ def summary(res: SimulationResult, kin: Kinematics) -> dict:
         "peak_corner_mm": float(res.max_corner_disp.max() * 1e3),
         "peak_fh_g": float(res.fh_com.max()),
         "min_fz_g": float(kin.fz.min()),
+        "min_limit_factor": float(np.min(vertical_factor(res, kin))) if T else 1.0,
         "peak_yaw_rate_deg_s": float(np.rad2deg(np.max(np.abs(kin.wz)))),
         "peak_yaw_acc_deg_s2": float(np.rad2deg(np.max(np.abs(kin.alpha)))),
     }
@@ -712,18 +752,7 @@ def friction_sweep(
     ratio = contact.mu_k / contact.mu_s if contact.mu_s > 0 else 1.0
     rows = []
     for mu in mus:
-        c = ContactParams(
-            mu_s=mu,
-            mu_k=mu * ratio if keep_ratio else min(contact.mu_k, mu),
-            model=contact.model,
-            com_offset=contact.com_offset,
-            corner_shares=contact.corner_shares,
-            corner_inset=contact.corner_inset,
-            pad_size=contact.pad_size,
-            nx=contact.nx,
-            ny=contact.ny,
-            corner_mu_factors=contact.corner_mu_factors,
-        )
+        c = dataclasses.replace(contact, mu_s=mu, mu_k=mu * ratio if keep_ratio else min(contact.mu_k, mu))
         r = simulate(kin, cluster, c, sensor, solver, max_slip_seconds=max_slip_seconds)
         sm = summary(r, kin)
         rows.append(
@@ -752,6 +781,7 @@ def critical_moments(res: SimulationResult, kin: Kinematics, n: int = 10, min_se
     if len(peaks) == 0:
         peaks = np.array([int(np.argmax(mu))])
     peaks = peaks[np.argsort(-mu[peaks])][:n]
+    fzv = vertical_factor(res, kin)
     rows = []
     for i in peaks:
         mt, mr = res.mu_trans[i], res.mu_rot[i]
@@ -771,8 +801,8 @@ def critical_moments(res: SimulationResult, kin: Kinematics, n: int = 10, min_se
                 "Carrier motion": "Turning" if is_turning(kin, i, i) else "Straight",
                 "Horiz. accel. at CoM [g]": round(float(res.fh_com[i]), 3),
                 "Vertical [g]": round(float(kin.fz[i]), 3),
-                "Dynamic limit [g]": round(float(res.contact.mu_s * max(kin.fz[i], 0.0)), 3),
-                "Z effect on demand": f"{(1.0 / kin.fz[i] - 1.0) * 100:+.0f}%" if kin.fz[i] > 0 else "lift-off",
+                "Friction limit [g]": round(float(res.contact.mu_s * fzv[i]), 3),
+                "Z effect on demand": f"{(1.0 / fzv[i] - 1.0) * 100:+.0f}%" if fzv[i] > 0 else "lift-off",
                 "Yaw accel. [deg/s2]": round(float(np.rad2deg(kin.alpha[i])), 1),
                 "Predicted slip": "Yes" if res.sliding[max(i - 1, 0) : i + 2].any() else "No",
             }

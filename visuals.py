@@ -18,7 +18,7 @@ from plotly.subplots import make_subplots
 
 from data_io import Kinematics
 from motion import STATE_MOVING, STATE_ROTATING, STATE_UNKNOWN
-from slip_model import CORNER_NAMES, SimulationResult
+from slip_model import CORNER_NAMES, SimulationResult, vertical_factor
 
 # Categorical palette (fixed order) and reserved status / ink colours
 C1 = "#2a78d6"  # blue
@@ -120,19 +120,31 @@ def _window(res: SimulationResult, t0: float | None, t1: float | None) -> slice:
 
 
 def friction_demand_g(res: SimulationResult, kin: Kinematics) -> np.ndarray:
-    """Friction the cluster needs, as an equivalent acceleration [g] = required μ × vertical acceleration.
+    """Friction the cluster needs, as an equivalent acceleration [g] = required μ × vertical factor.
 
     Equals the horizontal acceleration at the cluster CoM when the carrier does not rotate, and adds the rotational
-    (turntable) load when it does. It is directly comparable with the dynamic friction limit μs·f_z: the cluster
-    slips where demand ≥ limit (i.e. required μ ≥ μs).
+    (turntable) load when it does. It is directly comparable with the friction limit (μs × vertical factor): the
+    cluster slips where demand ≥ limit (i.e. required μ ≥ μs).
     """
     mu = np.where(np.isfinite(res.mu_req), res.mu_req, 5.0)
-    return np.clip(mu, 0.0, 5.0) * np.clip(kin.fz, 0.0, None)
+    return np.clip(mu, 0.0, 5.0) * vertical_factor(res, kin)
 
 
 def dynamic_limit_g(res: SimulationResult, kin: Kinematics) -> np.ndarray:
-    """Friction available as an equivalent acceleration [g] = μs × vertical acceleration."""
-    return res.contact.mu_s * np.clip(kin.fz, 0.0, None)
+    """Friction available as an equivalent acceleration [g] = μs × vertical factor (fixed: μs)."""
+    return res.contact.mu_s * vertical_factor(res, kin)
+
+
+def limit_is_fixed(res: SimulationResult) -> bool:
+    return getattr(res.contact, "normal_mode", "dynamic") == "fixed"
+
+
+def limit_name(res: SimulationResult) -> str:
+    """Legend name of the friction limit for the mode chosen in the sidebar."""
+    if limit_is_fixed(res):
+        return f"Friction limit μs = {res.contact.mu_s:.3f} (fixed)"
+    w = float(getattr(res.contact, "normal_smooth_s", 0.0) or 0.0)
+    return "Dynamic friction limit μs·min(f_z, 1)" + (f", smoothed {w * 1000:.0f} ms" if w > 0 else "")
 
 
 # --------------------------------------------------------------------------- #
@@ -157,12 +169,14 @@ def fig_kinematics(kin: Kinematics, res: SimulationResult, t0=None, t1=None) -> 
     fig.add_trace(_line(t, res.fhx_com[w], "X (length)", C1), row=1, col=1)
     fig.add_trace(_line(t, res.fhy_com[w], "Y (width)", C2), row=1, col=1)
     fig.add_trace(_line(t, res.fh_com[w], "Magnitude", C3), row=1, col=1)
-    fig.add_trace(
-        _line(t, res.contact.mu_s * np.clip(kin.fz[w], 0, None), "Dynamic friction limit μs·f_z", CRITICAL, width=1.2),
-        row=1,
-        col=1,
-    )
+    fig.add_trace(_line(t, dynamic_limit_g(res, kin)[w], limit_name(res), CRITICAL, width=1.2), row=1, col=1)
     fig.add_trace(_line(t, kin.fz[w], "Vertical", C1, showlegend=False), row=2, col=1)
+    if not limit_is_fixed(res):
+        fig.add_trace(
+            _line(t, vertical_factor(res, kin)[w], "Vertical used for the friction limit", CRITICAL, width=1.2),
+            row=2,
+            col=1,
+        )
     fig.add_trace(_line(t, np.rad2deg(kin.wz[w]), "Yaw rate", C1, showlegend=False, hover_fmt=".2f"), row=3, col=1)
     fig.add_trace(_line(t, np.rad2deg(kin.alpha[w]), "Yaw accel.", C1, showlegend=False, hover_fmt=".1f"), row=4, col=1)
     _shade_slip(fig, res, rows=[1, 2, 3, 4], t0=t[0], t1=t[-1])
@@ -773,7 +787,7 @@ def fig_compare(df: pd.DataFrame, mu_s: float, peaks: dict | None = None) -> go.
 # Turntables
 # --------------------------------------------------------------------------- #
 def fig_rotation_timeline(kin: Kinematics, res: SimulationResult, rotations, pad_s: float) -> go.Figure:
-    """Yaw rate, friction demand vs. dynamic friction limit and heading, with the detected rotations highlighted."""
+    """Yaw rate, friction demand vs. friction limit and heading, with the detected rotations highlighted."""
     t = res.t
     fig = make_subplots(
         rows=3,
@@ -782,14 +796,14 @@ def fig_rotation_timeline(kin: Kinematics, res: SimulationResult, rotations, pad
         vertical_spacing=0.07,
         subplot_titles=(
             "Carrier yaw rate [deg/s]  (shaded: detected rotations)",
-            "Friction demand vs. dynamic friction limit [g]  (light bands: turntable entry / exit windows)",
+            "Friction demand vs. friction limit [g]  (light bands: turntable entry / exit windows)",
             "Carrier heading [deg]  (integrated yaw rate)",
         ),
     )
     fig.add_trace(_line(t, np.rad2deg(kin.wz), "Yaw rate", C1, showlegend=False, hover_fmt=".2f"), row=1, col=1)
     fig.add_trace(_line(t, friction_demand_g(res, kin), "Friction demand", C1, width=1.5), row=2, col=1)
     fig.add_trace(
-        _line(t, dynamic_limit_g(res, kin), "Dynamic friction limit μs·f_z", CRITICAL, width=1.2), row=2, col=1
+        _line(t, dynamic_limit_g(res, kin), limit_name(res), CRITICAL, width=1.2), row=2, col=1
     )
     fig.add_trace(_line(t, np.rad2deg(kin.heading), "Heading", C1, showlegend=False, hover_fmt=".1f"), row=3, col=1)
     for r in rotations:
@@ -829,7 +843,7 @@ def fig_turn_detail(kin: Kinematics, res: SimulationResult, w0: float, w1: float
         vertical_spacing=0.06,
         subplot_titles=(
             "Carrier yaw rate [deg/s]",
-            "Friction demand vs. dynamic friction limit [g]  (red bands = predicted slip)",
+            "Friction demand vs. friction limit [g]  (red bands = predicted slip)",
             "Carrier yaw acceleration [deg/s²]",
             "Vertical acceleration [g]",
         ),
@@ -837,7 +851,7 @@ def fig_turn_detail(kin: Kinematics, res: SimulationResult, w0: float, w1: float
     fig.add_trace(_line(t, np.rad2deg(kin.wz[w]), "Yaw rate", C1, showlegend=False, hover_fmt=".2f"), row=1, col=1)
     fig.add_trace(_line(t, friction_demand_g(res, kin)[w], "Friction demand", C1, width=1.8), row=2, col=1)
     fig.add_trace(
-        _line(t, dynamic_limit_g(res, kin)[w], "Dynamic friction limit μs·f_z", CRITICAL, width=1.2), row=2, col=1
+        _line(t, dynamic_limit_g(res, kin)[w], limit_name(res), CRITICAL, width=1.2), row=2, col=1
     )
     fig.add_trace(_line(t, np.rad2deg(kin.alpha[w]), "Yaw accel.", C1, showlegend=False, hover_fmt=".1f"), row=3, col=1)
     fig.add_trace(_line(t, kin.fz[w], "Vertical", C1, showlegend=False), row=4, col=1)
@@ -860,7 +874,7 @@ def fig_turn_compare(series: list[dict]) -> go.Figure:
         vertical_spacing=0.07,
         subplot_titles=(
             "|Carrier yaw rate| [deg/s]",
-            "Friction demand vs. dynamic friction limit [g]  (solid = demand, thin = limit of the same recording)",
+            "Friction demand vs. friction limit [g]  (solid = demand, thin = limit of the same recording)",
             "Yaw acceleration in the turning direction [deg/s²]  (+ spin-up, − braking)",
         ),
     )
@@ -871,7 +885,7 @@ def fig_turn_compare(series: list[dict]) -> go.Figure:
         fig.add_trace(_line(t, sdict["yaw_rate"], lab, col, width=2, hover_fmt=".2f"), row=1, col=1)
         fig.add_trace(_line(t, sdict["demand_g"], lab, col, width=2, showlegend=False), row=2, col=1)
         fig.add_trace(
-            _line(t, sdict["limit_g"], f"{lab} · dynamic limit", col, width=1, showlegend=False), row=2, col=1
+            _line(t, sdict["limit_g"], f"{lab} · limit", col, width=1, showlegend=False), row=2, col=1
         )
         fig.add_trace(_line(t, sdict["yaw_acc"], lab, col, width=1.5, showlegend=False, hover_fmt=".1f"), row=3, col=1)
     for row in (1, 2, 3):
@@ -937,34 +951,34 @@ def fig_turn_profiles(kin: Kinematics, rotations, pre_s: float = 1.0, post_s: fl
 # Dynamic friction limit and speed profile
 # --------------------------------------------------------------------------- #
 def fig_dynamic_limit(kin: Kinematics, res: SimulationResult, t0=None, t1=None) -> go.Figure:
-    """Horizontal acceleration at the cluster CoM against the friction limit that moves with the vertical acceleration."""
+    """Friction demand against the friction limit (dynamic: drops with the vertical acceleration; or fixed)."""
     w = _window(res, t0, t1)
     t = res.t[w]
     lim = dynamic_limit_g(res, kin)[w]
     fig = go.Figure()
     fig.add_trace(_line(t, friction_demand_g(res, kin)[w], "Friction demand (translation + rotation)", C1, width=1.5))
-    fig.add_trace(_line(t, lim, "Dynamic friction limit μs·f_z", CRITICAL, width=1.5))
-    fig.add_hline(
-        y=res.contact.mu_s,
-        line=dict(color=MUTED, width=1),
-        annotation_text=f"Static limit at 1 g = μs ({res.contact.mu_s:.3f} g)",
-        annotation_position="top left",
-    )
+    fig.add_trace(_line(t, lim, limit_name(res), CRITICAL, width=1.5))
+    if not limit_is_fixed(res):
+        fig.add_hline(
+            y=res.contact.mu_s,
+            line=dict(color=MUTED, width=1),
+            annotation_text=f"Static limit at 1 g = μs ({res.contact.mu_s:.3f} g)",
+            annotation_position="top left",
+        )
     _shade_slip(fig, res, t0=t[0], t1=t[-1])
     fig.update_yaxes(title_text="Acceleration [g]", rangemode="tozero")
     fig.update_xaxes(title_text="Time from recording start [s]")
-    fig.update_layout(
-        title=dict(
-            text="Friction demand vs. dynamic friction limit (the limit drops when the vertical acceleration drops)",
-            x=0,
-            font=dict(size=14),
-        )
+    title = (
+        "Friction demand vs. fixed friction limit μs"
+        if limit_is_fixed(res)
+        else "Friction demand vs. dynamic friction limit (drops when the vertical acceleration drops, never rises)"
     )
+    fig.update_layout(title=dict(text=title, x=0, font=dict(size=14)))
     return _base_layout(fig, 380)
 
 
 def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, qual, rotations) -> go.Figure:
-    """Estimated travel speed, friction demand vs. dynamic friction limit, and yaw rate for the whole record."""
+    """Estimated travel speed, friction demand vs. friction limit, and yaw rate for the whole record."""
     t = res.t
     fig = make_subplots(
         rows=3,
@@ -973,7 +987,7 @@ def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, qual, rota
         vertical_spacing=0.07,
         subplot_titles=(
             "Estimated travel speed [m/s]  (grey: low reliability, long segment without a stop)",
-            "Friction demand vs. dynamic friction limit [g]  (red bands = predicted slip)",
+            "Friction demand vs. friction limit [g]  (red bands = predicted slip)",
             "Carrier yaw rate [deg/s]  (turntables)",
         ),
     )
@@ -983,7 +997,7 @@ def fig_speed_timeline(kin: Kinematics, res: SimulationResult, speed, qual, rota
     fig.add_trace(_line(t, v_poor, "Travel speed (low reliability)", MUTED, width=1.5, hover_fmt=".2f"), row=1, col=1)
     fig.add_trace(_line(t, friction_demand_g(res, kin), "Friction demand", C1, width=1.5), row=2, col=1)
     fig.add_trace(
-        _line(t, dynamic_limit_g(res, kin), "Dynamic friction limit μs·f_z", CRITICAL, width=1.2), row=2, col=1
+        _line(t, dynamic_limit_g(res, kin), limit_name(res), CRITICAL, width=1.2), row=2, col=1
     )
     fig.add_trace(_line(t, np.rad2deg(kin.wz), "Yaw rate", C1, showlegend=False, hover_fmt=".1f"), row=3, col=1)
     for r in rotations:
