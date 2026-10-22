@@ -43,6 +43,7 @@ _LOCAL_MODULES = (
     "line_layout_data",
     "line_layout",
     "whole_route",
+    "type_m",
     "visuals",
 )
 
@@ -113,6 +114,14 @@ from line_layout import station_display
 from line_layout import network as layout_network
 from line_layout import stations_table as layout_stations
 from whole_route import accumulate, effective_mu, totals
+from type_m import (
+    TYPE_M_LENGTH_M,
+    TYPE_M_SPEC_MM,
+    TYPE_M_WIDTH_M,
+    auto_magnification,
+    corner_deviations,
+    placement,
+)
 from turns import (
     TurnSettings,
     analyse_rotations,
@@ -123,6 +132,7 @@ from turns import (
 )
 from visuals import (
     PLOT_CONFIG,
+    fig_type_m,
     auto_exaggeration,
     fig_compare,
     fig_corner_paths,
@@ -147,7 +157,7 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
@@ -769,9 +779,20 @@ with st.sidebar:
 
     with st.expander("4 · Cell cluster", expanded=True):
         mass = st.number_input("Mass [kg]", value=400.0, min_value=1.0, step=10.0)
-        c1, c2 = st.columns(2)
-        length = c1.number_input("Length [m]", value=2.0, min_value=0.05, step=0.05, format="%.3f")
-        width = c2.number_input("Width [m]", value=1.0, min_value=0.05, step=0.05, format="%.3f")
+        footprint = st.radio(
+            "Footprint",
+            ["Custom", "Type M"],
+            horizontal=True,
+            help=f"Type M: {TYPE_M_LENGTH_M:.3f} × {TYPE_M_WIDTH_M:.3f} m, the distance between the nominal corners "
+            "of a Type M module in the ST020 corner measurement. Used for the contact area and the yaw inertia.",
+        )
+        if footprint == "Type M":
+            length, width = TYPE_M_LENGTH_M, TYPE_M_WIDTH_M
+            st.caption(f"Length {length:.3f} m × width {width:.3f} m (Type M nominal corners).")
+        else:
+            c1, c2 = st.columns(2)
+            length = c1.number_input("Length [m]", value=2.0, min_value=0.05, step=0.05, format="%.3f")
+            width = c2.number_input("Width [m]", value=1.0, min_value=0.05, step=0.05, format="%.3f")
         default_I = mass * (length**2 + width**2) / 12.0
         inertia_on = st.toggle(
             "Override yaw inertia", value=False, help=f"Default (uniform block): {default_I:.1f} kg·m²"
@@ -1343,6 +1364,102 @@ def route_selection(where: str):
     return incl, extras
 
 
+TM_FRONT = ["Carrier front (+X)", "Carrier rear (−X)"]
+TM_MAG = ["Auto", "×10", "×20", "×40", "×80", "×160", "×320"]
+
+
+def _mu_variant(mu: float) -> dict:
+    """Contact settings at another μs, same μk / μs ratio."""
+    ratio = (mu_k / mu_s) if mu_s > 0 else 1.0
+    return dict(contact_d, mu_s=float(mu), mu_k=float(mu) * ratio)
+
+
+def render_type_m(shift: dict, com_m, shift_at_mu, scope_note: str) -> None:
+    """Predicted corner deviation of a Type M module, in the ST020 corner-measurement coordinates.
+
+    shift: dx_mm, dy_mm, rot_deg (carrier frame) with the current settings; com_m: CoM relative to the footprint
+    centre [m]; shift_at_mu(mu) -> the same at another μs (for the uncertainty range)."""
+    st.markdown("##### Predicted corner deviation · Type M")
+    st.caption(
+        "Where the four corners of a Type M module end up after " + scope_note + ", drawn like the ST020 corner "
+        "measurement: same nominal corners and coordinates (X towards the front, left corners negative Y), "
+        "deviation = position − nominal, centroid and rotation angle with the same definitions. The module starts "
+        "at its nominal position, so this is the deviation caused by the recorded transport only."
+    )
+    c = st.columns(4)
+    front = c[0].selectbox(
+        "Module front (FL / FR) faces",
+        TM_FRONT,
+        key="tm_front",
+        help="How the module sits on the carrier. Carrier +X is the direction set under 2 · Sensor mounting.",
+    )
+    tol = c[1].number_input(
+        "Tolerance ± [mm]",
+        value=float(TYPE_M_SPEC_MM),
+        min_value=0.1,
+        step=0.5,
+        key="tm_tol",
+        help="Per corner and axis, as in the ST020 measurement (default ±3 mm).",
+    )
+    mag = c[2].selectbox("Magnification", TM_MAG, key="tm_mag")
+    band = c[3].number_input(
+        "Range: μs ±",
+        value=0.0,
+        min_value=0.0,
+        max_value=0.10,
+        step=0.01,
+        format="%.3f",
+        key="tm_band",
+        help="Also draws the module for μs − this value (more slip) and μs + this value (less slip), with the same "
+        "μk / μs ratio. The amount of slip depends strongly on μ, which is not measured: the range shows how "
+        "much. 0 = off.",
+    )
+    fpx = front == TM_FRONT[0]
+    dev = corner_deviations(shift["dx_mm"], shift["dy_mm"], shift["rot_deg"], com_m, fpx)
+    variants = []
+    if band > 0:
+        with st.spinner("Simulating the μs range..."):
+            for mu_v in (max(mu_s - band, 0.01), mu_s + band):
+                sv = shift_at_mu(mu_v)
+                variants.append(
+                    (f"μs = {mu_v:.3f}", corner_deviations(sv["dx_mm"], sv["dy_mm"], sv["rot_deg"], com_m, fpx))
+                )
+    pl = placement(dev)
+    max_all = max([pl["max_abs_mm"]] + [placement(v)["max_abs_mm"] for _, v in variants])
+    k = auto_magnification(max_all, tol) if mag == "Auto" else int(mag.lstrip("×"))
+    m = st.columns(4)
+    m[0].metric("Centroid X", f"{pl['centroid_x_mm']:+.2f} mm")
+    m[1].metric("Centroid Y", f"{pl['centroid_y_mm']:+.2f} mm")
+    m[2].metric("Rotation angle", f"{pl['rotation_deg']:+.3f}°", help="Change of the angle of the rear-mid → front-mid line, as in the ST020 app.")
+    m[3].metric(
+        "Largest corner deviation",
+        f"{pl['max_abs_mm']:.2f} mm",
+        "within tolerance" if pl["max_abs_mm"] <= tol else "out of tolerance",
+        delta_color="off" if pl["max_abs_mm"] <= tol else "inverse",
+        help="Largest |X| or |Y| of the four corners.",
+    )
+    st.plotly_chart(fig_type_m(dev, tol, k, variants), config=PLOT_CONFIG, key="tm_fig")
+    tab = dev[["Corner", "X [mm]", "Y [mm]"]].copy()
+    if variants:
+        for ax_ in ("X", "Y"):
+            vals = np.vstack([tab[f"{ax_} [mm]"].to_numpy()] + [v[f"{ax_} [mm]"].to_numpy() for _, v in variants])
+            tab[f"{ax_} range [mm]"] = [f"{lo:+.2f} … {hi:+.2f}" for lo, hi in zip(vals.min(axis=0), vals.max(axis=0))]
+    tab["Status"] = np.where((tab[["X [mm]", "Y [mm]"]].abs() > tol).any(axis=1), "Out of tolerance", "OK")
+    st.dataframe(tab.round(2), hide_index=True)
+    notes = []
+    if abs(length - TYPE_M_LENGTH_M) > 0.005 or abs(width - TYPE_M_WIDTH_M) > 0.005:
+        notes.append(
+            f"The simulation uses a {length:.3f} × {width:.3f} m footprint; Type M is {TYPE_M_LENGTH_M:.3f} × "
+            f"{TYPE_M_WIDTH_M:.3f} m. Choose Footprint → Type M under 4 · Cell cluster to simulate the rotation with "
+            "the Type M footprint."
+        )
+    notes.append(
+        "The direction of the movement is more reliable than its size: the size depends strongly on μs and μk "
+        "(use the μs range above). Compare with measured modules before relying on the millimetres."
+    )
+    st.caption(" ".join(notes))
+
+
 def render_route_slip_events() -> None:
     st.caption(
         "Every uploaded recording is simulated over its full length with the current settings and put in line order "
@@ -1372,6 +1489,23 @@ def render_route_slip_events() -> None:
     st.caption(
         "Bars: shift caused by each segment on its own (red = it slips). Line: shift of the cluster accumulated "
         "from the start of the line up to that segment."
+    )
+    pre_full = dict(pre, t_start=None, t_end=None)
+
+    def _route_shift_at(mu: float) -> dict:
+        c_mu = _mu_variant(mu)
+        acc = {"dx_mm": 0.0, "dy_mm": 0.0, "rot_deg": 0.0}
+        for n_, _r in incl:
+            p_ = route_point(valid[n_], n_, pre_full, cluster_d, c_mu, sensor_d, solver_d)
+            for k_ in acc:
+                acc[k_] += float(p_[k_])
+        return acc
+
+    render_type_m(
+        {k_: tot[k_] for k_ in ("dx_mm", "dy_mm", "rot_deg")},
+        (-np.asarray(rel, dtype=float).mean(axis=0)).tolist(),
+        _route_shift_at,
+        f"all {len(incl)} recordings in line order",
     )
     st.markdown("##### Slip events of all recordings")
     frames = []
@@ -1979,6 +2113,17 @@ with tab_ev, tab_guard("Slip events"):
                 st.plotly_chart(fig_motion(res, tol_mm, e0, e1), config=PLOT_CONFIG, key="ev_motion")
             with c2:
                 st.plotly_chart(fig_corner_paths(res, e0, e1), config=PLOT_CONFIG, key="ev_corners")
+
+        def _active_shift_at(mu: float) -> dict:
+            r_ = run_simulation(data, active, pre, cluster_d, _mu_variant(mu), sensor_d, solver_d)
+            return {"dx_mm": float(r_.ux[-1]) * 1e3, "dy_mm": float(r_.uy[-1]) * 1e3, "rot_deg": float(np.rad2deg(r_.phi[-1]))}
+
+        render_type_m(
+            {"dx_mm": float(res.ux[-1]) * 1e3, "dy_mm": float(res.uy[-1]) * 1e3, "rot_deg": float(np.rad2deg(res.phi[-1]))},
+            np.asarray(res.patch.com, dtype=float).tolist(),
+            _active_shift_at,
+            "this recording",
+        )
 
         with st.expander("Video synchronisation", expanded=False):
             st.caption(

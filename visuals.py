@@ -1519,3 +1519,138 @@ def fig_route_sweep(
     f1.update_layout(title=dict(text="Whole route: corner shift at the end", x=0, font=dict(size=14)))
     f2.update_layout(title=dict(text="Whole route: cluster rotation at the end", x=0, font=dict(size=14)), showlegend=False)
     return f1, f2
+
+
+# --------------------------------------------------------------------------- #
+# Type M corner deviations (ST020 coordinates)
+# --------------------------------------------------------------------------- #
+def _rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+
+
+def fig_type_m(
+    dev: pd.DataFrame,
+    tol_mm: float,
+    k: float,
+    variants: list[tuple[str, pd.DataFrame]] | None = None,
+    title: str = "Predicted corner deviation · Type M",
+) -> go.Figure:
+    """Type M module drawn against its nominal outline (ST020 / CAD coordinates), deviations magnified ×k, with the
+    ± tolerance box around every nominal corner, as in the ST020 corner-deviation app."""
+    order = ["FL", "FR", "RR", "RL", "FL"]
+    d = dev.set_index("Corner")
+    nx, ny = d["Nominal X [mm]"], d["Nominal Y [mm]"]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[nx[c] for c in order],
+            y=[ny[c] for c in order],
+            mode="lines",
+            name="Nominal Type M",
+            line=dict(color=MUTED, width=2, dash="dash"),
+            hoverinfo="skip",
+        )
+    )
+    half = float(tol_mm) * k
+    bx, by = [], []
+    for c in order[:-1]:
+        x0, y0 = float(nx[c]), float(ny[c])
+        bx += [x0 - half, x0 + half, x0 + half, x0 - half, x0 - half, None]
+        by += [y0 - half, y0 - half, y0 + half, y0 + half, y0 - half, None]
+    fig.add_trace(
+        go.Scatter(
+            x=bx,
+            y=by,
+            mode="lines",
+            name=f"Tolerance ±{tol_mm:g} mm",
+            line=dict(color=C4, width=1.2, dash="dot"),
+            hoverinfo="skip",
+        )
+    )
+    for i, (lab, dv) in enumerate(variants or []):
+        v = dv.set_index("Corner")
+        fig.add_trace(
+            go.Scatter(
+                x=[nx[c] + k * v.at[c, "X [mm]"] for c in order],
+                y=[ny[c] + k * v.at[c, "Y [mm]"] for c in order],
+                mode="lines",
+                name=lab,
+                line=dict(color=_rgba(C1, 0.55), width=1.5, dash="dot" if i == 0 else "dashdot"),
+                hovertext=[f"{lab} · {c}: X {v.at[c, 'X [mm]']:+.2f} · Y {v.at[c, 'Y [mm]']:+.2f} mm" for c in order],
+                hoverinfo="text",
+            )
+        )
+    px = {c: float(nx[c] + k * d.at[c, "X [mm]"]) for c in order[:-1]}
+    py = {c: float(ny[c] + k * d.at[c, "Y [mm]"]) for c in order[:-1]}
+    fig.add_trace(
+        go.Scatter(
+            x=[px[c] for c in order],
+            y=[py[c] for c in order],
+            mode="lines+markers",
+            name="Predicted",
+            line=dict(color=C1, width=3),
+            marker=dict(size=9, color=C1, line=dict(color="white", width=2)),
+            hovertext=[f"{c}: X {d.at[c, 'X [mm]']:+.2f} · Y {d.at[c, 'Y [mm]']:+.2f} mm" for c in order],
+            hoverinfo="text",
+        )
+    )
+    for c in order[:-1]:
+        dx, dy = float(d.at[c, "X [mm]"]), float(d.at[c, "Y [mm]"])
+        out = abs(dx) > tol_mm or abs(dy) > tol_mm
+        col = CRITICAL if out else INK_2
+        if np.hypot(dx, dy) * k > 1.0:
+            fig.add_annotation(
+                x=px[c],
+                y=py[c],
+                ax=float(nx[c]),
+                ay=float(ny[c]),
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowwidth=2.5,
+                arrowcolor=col,
+                text="",
+            )
+        fig.add_annotation(
+            x=float(nx[c]),
+            y=float(ny[c]),
+            text=f"<b>{c}</b>  X {dx:+.2f} · Y {dy:+.2f}",
+            showarrow=False,
+            yshift=26 if ny[c] < 0 else -26,
+            font=dict(size=12, color=col),
+            bgcolor="rgba(255,255,255,0.85)",
+        )
+    span = max(half, k * float(np.max(np.abs(d[["X [mm]", "Y [mm]"]].to_numpy())))) + 140.0
+    fig.update_xaxes(
+        title_text="Global X (mm) — front →",
+        range=[float(nx.min()) - span, float(nx.max()) + span],
+        showgrid=False,
+        zeroline=False,
+    )
+    fig.update_yaxes(
+        title_text="Global Y (mm)",
+        range=[float(ny.max()) + span, float(ny.min()) - span],
+        scaleanchor="x",
+        scaleratio=1,
+        showgrid=False,
+        zeroline=False,
+    )
+    fig.add_annotation(
+        x=1,
+        y=0,
+        xref="paper",
+        yref="paper",
+        xanchor="right",
+        yanchor="bottom",
+        showarrow=False,
+        text=f"deviations ×{k:g} · boxes = ±{tol_mm:g} mm (scaled) · view from above",
+        font=dict(size=11, color=MUTED),
+    )
+    fig.update_layout(title=dict(text=title, x=0, font=dict(size=14)))
+    _base_layout(fig, 560)
+    fig.update_layout(hovermode="closest")
+    return fig

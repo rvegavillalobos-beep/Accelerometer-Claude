@@ -38,6 +38,10 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   buffer) and added up, as if one part had travelled all the measured segments: slip events of every recording,
   shift accumulated along the route, and the friction sweep for the whole route with the effective μ that explains
   the shift measured on the part at the end of the line.
+- Predicted corner deviation of a Type M module (Slip events tab, single recording or whole route): the simulated
+  shift and rotation applied to the Type M nominal corners of the ST020 corner measurement (RICKHARD X), drawn and
+  numbered like that app (X towards the front, left corners negative Y, ±3 mm boxes, centroid and rotation angle),
+  with an optional μs ± range. The cluster footprint can be set to Type M (1.681 × 1.118 m) in the sidebar.
 - Line map tab: the plant layout, the conveyor path and the station positions are embedded in the app. Every
   uploaded recording (one or more) is drawn where its file name says it was measured: `St430-440` as the transport
   along the conveyors in the flow direction (ST 130 → buffer), `St981-Buffer` to the buffer, and a name with one
@@ -69,6 +73,7 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `motion.py` | Travel direction and motion phase of the carrier |
 | `visuals.py` | Plotly figures and the animated top view |
 | `whole_route.py` | Shifts of all recordings added up along the line, effective μ from a measured shift |
+| `type_m.py` | Type M nominal corners (ST020) and the predicted corner deviations, centroid and rotation angle |
 | `line_layout.py` | File names → line sections, shortest way along the conveyors, loops |
 | `line_layout_data.py` | Embedded conveyor graph and station table (generated) |
 | `assets/line_layout.png` | Layout background of the line map (generated) |
