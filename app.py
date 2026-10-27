@@ -157,7 +157,7 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
@@ -1376,6 +1376,7 @@ def route_selection(where: str):
 
 
 TM_FRONT = ["Carrier front (+X)", "Carrier rear (−X)"]
+MUTED_INK = "#898781"
 TM_MAG = ["Auto", "×10", "×20", "×40", "×80", "×160", "×320"]
 
 
@@ -1385,7 +1386,7 @@ def _mu_variant(mu: float) -> dict:
     return dict(contact_d, mu_s=float(mu), mu_k=float(mu) * ratio)
 
 
-def render_type_m(shift: dict, com_m, shift_at_mu, scope_note: str) -> None:
+def render_type_m(shift: dict, com_m, shift_at_mu, scope_note: str, reference: dict | None = None) -> None:
     """Predicted corner deviation of a Type M module, in the ST020 corner-measurement coordinates.
 
     shift: dx_mm, dy_mm, rot_deg (carrier frame) with the current settings; com_m: CoM relative to the footprint
@@ -1435,13 +1436,27 @@ def render_type_m(shift: dict, com_m, shift_at_mu, scope_note: str) -> None:
                 variants.append(
                     (f"μs = {mu_v:.3f}", corner_deviations(sv["dx_mm"], sv["dy_mm"], sv["rot_deg"], com_m, fpx))
                 )
+    if reference is not None:  # what-if: the module as measured, for comparison
+        ref_dev = corner_deviations(reference["dx_mm"], reference["dy_mm"], reference["rot_deg"], com_m, fpx)
+        variants.append(("As measured (no fix)", ref_dev, MUTED_INK, "dash"))
     pl = placement(dev)
-    max_all = max([pl["max_abs_mm"]] + [placement(v)["max_abs_mm"] for _, v in variants])
+    max_all = max([pl["max_abs_mm"]] + [placement(v[1])["max_abs_mm"] for v in variants])
     k = auto_magnification(max_all, tol) if mag == "Auto" else int(mag.lstrip("×"))
     m = st.columns(4)
-    m[0].metric("Centroid X", f"{pl['centroid_x_mm']:+.2f} mm")
-    m[1].metric("Centroid Y", f"{pl['centroid_y_mm']:+.2f} mm")
-    m[2].metric("Rotation angle", f"{pl['rotation_deg']:+.3f}°", help="Change of the angle of the rear-mid → front-mid line, as in the ST020 app.")
+    pr = placement(ref_dev) if reference is not None else None
+
+    def _vs(key, fmt, unit):
+        return None if pr is None else f"{pl[key] - pr[key]:{fmt}}{unit} vs as measured"
+
+    m[0].metric("Centroid X", f"{pl['centroid_x_mm']:+.2f} mm", _vs("centroid_x_mm", "+.2f", " mm"), delta_color="off")
+    m[1].metric("Centroid Y", f"{pl['centroid_y_mm']:+.2f} mm", _vs("centroid_y_mm", "+.2f", " mm"), delta_color="off")
+    m[2].metric(
+        "Rotation angle",
+        f"{pl['rotation_deg']:+.3f}°",
+        _vs("rotation_deg", "+.3f", "°"),
+        delta_color="off",
+        help="Change of the angle of the rear-mid → front-mid line, as in the ST020 app.",
+    )
     m[3].metric(
         "Largest corner deviation",
         f"{pl['max_abs_mm']:.2f} mm",
@@ -1449,11 +1464,19 @@ def render_type_m(shift: dict, com_m, shift_at_mu, scope_note: str) -> None:
         delta_color="off" if pl["max_abs_mm"] <= tol else "inverse",
         help="Largest |X| or |Y| of the four corners.",
     )
-    st.plotly_chart(fig_type_m(dev, tol, k, variants), config=PLOT_CONFIG, key="tm_fig")
+    st.plotly_chart(
+        fig_type_m(dev, tol, k, variants, main_name="With the fix" if reference is not None else "Predicted"),
+        config=PLOT_CONFIG,
+        key="tm_fig",
+    )
     tab = dev[["Corner", "X [mm]", "Y [mm]"]].copy()
-    if variants:
+    mu_vars = [v for v in variants if str(v[0]).startswith("μs")]
+    if reference is not None:
         for ax_ in ("X", "Y"):
-            vals = np.vstack([tab[f"{ax_} [mm]"].to_numpy()] + [v[f"{ax_} [mm]"].to_numpy() for _, v in variants])
+            tab[f"{ax_} as measured [mm]"] = ref_dev[f"{ax_} [mm]"].to_numpy()
+    if mu_vars:
+        for ax_ in ("X", "Y"):
+            vals = np.vstack([tab[f"{ax_} [mm]"].to_numpy()] + [v[1][f"{ax_} [mm]"].to_numpy() for v in mu_vars])
             tab[f"{ax_} range [mm]"] = [f"{lo:+.2f} … {hi:+.2f}" for lo, hi in zip(vals.min(axis=0), vals.max(axis=0))]
     tab["Status"] = np.where((tab[["X [mm]", "Y [mm]"]].abs() > tol).any(axis=1), "Out of tolerance", "OK")
     st.dataframe(tab.round(2), hide_index=True)
@@ -1482,24 +1505,64 @@ def render_route_slip_events() -> None:
     if sel is None:
         return
     incl, extras = sel
-    parts = route_parts(incl, extras)
+    names_in = [n for n, _ in incl]
+    sec_lab = {n: section_label(r) for n, r in incl}
+    st.session_state["ev_fixed"] = [n for n in st.session_state.get("ev_fixed", []) if n in names_in]
+    fixed = st.multiselect(
+        "What-if: simulate as fixed",
+        names_in,
+        key="ev_fixed",
+        format_func=lambda n: f"{n} · {sec_lab[n]}" if sec_lab.get(n) and sec_lab[n] != n else n,
+        help="The chosen recordings still belong to the route, but as if their problems had been fixed: they do not "
+        "move the cluster (no slip, no shift). Everything below, including the Type M module, then shows the route "
+        "with the fix, compared with the route as measured.",
+    )
+    parts_m = route_parts(incl, extras)
+    _zero = {"dx_mm": 0.0, "dy_mm": 0.0, "rot_deg": 0.0, "corner_mm": 0.0, "n_events": 0, "slip_time_s": 0.0}
+    parts = [dict(p_, **_zero) if p_["name"] in fixed else p_ for p_ in parts_m]
     rel = extras[incl[0][0]]["rel"]
     prog = accumulate(parts, rel)
     tot = totals(parts, rel)
+    prog_m = accumulate(parts_m, rel) if fixed else None
+    tot_m = totals(parts_m, rel) if fixed else None
+
+    def _d(key, fmt, unit=""):
+        if not fixed:
+            return None
+        return f"{tot[key] - tot_m[key]:{fmt}}{unit} vs as measured"
+
+    if fixed:
+        st.info(
+            f"What-if: {len(fixed)} of {len(incl)} recordings simulated as fixed ("
+            + ", ".join(fixed)
+            + "). The values below are with the fix; the change against the route as measured is shown under each."
+        )
     c = st.columns(5)
-    c[0].metric("Recordings", len(incl))
-    c[1].metric("Slip events", tot["n_events"])
-    c[2].metric("Slip time", f"{tot['slip_time_s']:.1f} s")
+    c[0].metric("Recordings", f"{len(incl)} ({len(fixed)} fixed)" if fixed else len(incl))
+    c[1].metric("Slip events", tot["n_events"], _d("n_events", "+d"), delta_color="inverse")
+    c[2].metric("Slip time", f"{tot['slip_time_s']:.1f} s", _d("slip_time_s", "+.1f", " s"), delta_color="inverse")
     c[3].metric(
         "Corner shift at the end",
         f"{tot['corner_mm']:.2f} mm",
+        _d("corner_mm", "+.2f", " mm"),
+        delta_color="inverse",
         help=f"If every segment had shifted the cluster the same way: {tot['sum_segment_corner_mm']:.2f} mm.",
     )
-    c[4].metric("Rotation at the end", f"{tot['rot_deg']:.3f}°")
-    st.plotly_chart(fig_route_progress(prog, tol_mm, mu_s), config=PLOT_CONFIG, key="route_progress")
+    c[4].metric("Rotation at the end", f"{tot['rot_deg']:.3f}°", _d("rot_deg", "+.3f", "°"), delta_color="off")
+    st.plotly_chart(
+        fig_route_progress(prog, tol_mm, mu_s, fixed=fixed, prog_measured=prog_m),
+        config=PLOT_CONFIG,
+        key="route_progress",
+    )
     st.caption(
         "Bars: shift caused by each segment on its own (red = it slips). Line: shift of the cluster accumulated "
         "from the start of the line up to that segment."
+        + (
+            " Grey bars: recordings simulated as fixed (their measured shift, which the fix removes); dashed line: "
+            "the route as measured."
+            if fixed
+            else ""
+        )
     )
     pre_full = dict(pre, t_start=None, t_end=None)
 
@@ -1507,6 +1570,8 @@ def render_route_slip_events() -> None:
         c_mu = _mu_variant(mu)
         acc = {"dx_mm": 0.0, "dy_mm": 0.0, "rot_deg": 0.0}
         for n_, _r in incl:
+            if n_ in fixed:
+                continue
             p_ = route_point(valid[n_], n_, pre_full, cluster_d, c_mu, sensor_d, solver_d)
             for k_ in acc:
                 acc[k_] += float(p_[k_])
@@ -1516,7 +1581,9 @@ def render_route_slip_events() -> None:
         {k_: tot[k_] for k_ in ("dx_mm", "dy_mm", "rot_deg")},
         (-np.asarray(rel, dtype=float).mean(axis=0)).tolist(),
         _route_shift_at,
-        f"all {len(incl)} recordings in line order",
+        f"all {len(incl)} recordings in line order"
+        + (f", with {len(fixed)} simulated as fixed (dashed grey: as measured)" if fixed else ""),
+        reference={k_: tot_m[k_] for k_ in ("dx_mm", "dy_mm", "rot_deg")} if fixed else None,
     )
     st.markdown("##### Slip events of all recordings")
     frames = []
@@ -1527,6 +1594,8 @@ def render_route_slip_events() -> None:
         e = e.copy()
         e.insert(0, "Section", section_label(r))
         e.insert(0, "Recording", n)
+        if fixed:
+            e.insert(2, "What-if", "Fixed (not counted)" if n in fixed else "")
         frames.append(e)
     if frames:
         allev = pd.concat(frames, ignore_index=True)
@@ -1535,6 +1604,7 @@ def render_route_slip_events() -> None:
             for c_ in [
                 "Recording",
                 "Section",
+                "What-if",
                 "Event",
                 "Start clock",
                 "Duration [s]",
@@ -1559,7 +1629,10 @@ def render_route_slip_events() -> None:
     else:
         st.info(f"No slip predicted on any of the recordings with μs = {mu_s:.3f}.")
     with st.expander("Shift per recording"):
-        st.dataframe(prog, hide_index=True)
+        prog_v = prog.copy()
+        if fixed:
+            prog_v.insert(2, "What-if", ["Fixed" if n in fixed else "" for n in prog_v["Recording"]])
+        st.dataframe(prog_v, hide_index=True)
 
 
 def render_route_sweep(mu_lo: float, mu_hi: float, n_mu: int, keep_ratio: bool) -> None:

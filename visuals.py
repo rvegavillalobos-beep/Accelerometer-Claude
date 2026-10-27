@@ -1381,26 +1381,55 @@ def fig_line_map(
 # --------------------------------------------------------------------------- #
 # Whole route (all recordings added up)
 # --------------------------------------------------------------------------- #
-def fig_route_progress(prog: pd.DataFrame, tolerance_mm: float, mu_s: float) -> go.Figure:
-    """Shift of every segment on its own (bars) and the cluster shift accumulated along the route (line)."""
-    labels = [str(r).rsplit(".", 1)[0] for r in prog["Recording"]]
-    seg = prog["Segment corner shift [mm]"].to_numpy(dtype=float)
+def fig_route_progress(
+    prog: pd.DataFrame,
+    tolerance_mm: float,
+    mu_s: float,
+    fixed: list[str] | None = None,
+    prog_measured: pd.DataFrame | None = None,
+) -> go.Figure:
+    """Shift of every segment on its own (bars) and the cluster shift accumulated along the route (line).
+
+    What-if: recordings in ``fixed`` are simulated as fixed (no shift). Their bar keeps the measured value in grey
+    (what fixing it removes) and the accumulated line of ``prog_measured`` (as measured) is drawn for comparison."""
+    fixed = set(fixed or [])
+    whatif = bool(fixed) and prog_measured is not None
+    src = prog_measured if whatif else prog
+    is_fixed = [r in fixed for r in src["Recording"]]
+    labels = [str(r).rsplit(".", 1)[0] + (" (fixed)" if f else "") for r, f in zip(src["Recording"], is_fixed)]
+    seg = src["Segment corner shift [mm]"].to_numpy(dtype=float)
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
             x=labels,
             y=seg,
-            name="Segment on its own",
-            marker=dict(color=[CRITICAL if v > 0 else C1 for v in seg]),
-            hovertemplate="%{x}<br>Segment shift %{y:.2f} mm<extra></extra>",
+            name="Segment on its own" + (" (grey: removed by the fix)" if whatif else ""),
+            marker=dict(
+                color=[_rgba(MUTED, 0.45) if f else (CRITICAL if v > 0 else C1) for v, f in zip(seg, is_fixed)],
+                line=dict(color=[MUTED if f else "rgba(0,0,0,0)" for f in is_fixed], width=1.5),
+            ),
+            customdata=["fixed: this shift is removed" if f else "" for f in is_fixed],
+            hovertemplate="%{x}<br>Segment shift %{y:.2f} mm as measured<br>%{customdata}<extra></extra>",
         )
     )
+    if whatif:
+        fig.add_trace(
+            go.Scatter(
+                x=labels,
+                y=prog_measured["Cumulative max corner shift [mm]"],
+                mode="lines+markers",
+                name="Accumulated · as measured",
+                line=dict(color=MUTED, width=2, dash="dash"),
+                marker=dict(size=6),
+                hovertemplate="%{x}<br>As measured: accumulated max corner shift %{y:.2f} mm<extra></extra>",
+            )
+        )
     fig.add_trace(
         go.Scatter(
             x=labels,
             y=prog["Cumulative max corner shift [mm]"],
             mode="lines+markers",
-            name="Accumulated along the route",
+            name="Accumulated · with the fix" if whatif else "Accumulated along the route",
             line=dict(color=INK_2, width=2.5),
             marker=dict(size=8),
             customdata=np.c_[
@@ -1420,7 +1449,12 @@ def fig_route_progress(prog: pd.DataFrame, tolerance_mm: float, mu_s: float) -> 
     fig.update_yaxes(title_text="Max corner shift [mm]", rangemode="tozero")
     fig.update_xaxes(title_text="Recordings in line order (ST 130 → buffer)", tickangle=-35)
     fig.update_layout(
-        title=dict(text=f"Cluster shift along the route (μs {mu_s:.3f})", x=0, font=dict(size=14)),
+        title=dict(
+            text=f"Cluster shift along the route (μs {mu_s:.3f})"
+            + (f" · what-if: {len(fixed)} recording(s) fixed" if whatif else ""),
+            x=0,
+            font=dict(size=14),
+        ),
         height=430,
         margin=dict(l=10, r=10, t=50, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -1535,6 +1569,7 @@ def fig_type_m(
     k: float,
     variants: list[tuple[str, pd.DataFrame]] | None = None,
     title: str = "Predicted corner deviation · Type M",
+    main_name: str = "Predicted",
 ) -> go.Figure:
     """Type M module drawn against its nominal outline (ST020 / CAD coordinates), deviations magnified ×k, with the
     ± tolerance box around every nominal corner, as in the ST020 corner-deviation app."""
@@ -1568,7 +1603,10 @@ def fig_type_m(
             hoverinfo="skip",
         )
     )
-    for i, (lab, dv) in enumerate(variants or []):
+    for i, var in enumerate(variants or []):
+        lab, dv = var[0], var[1]
+        col = var[2] if len(var) > 2 else _rgba(C1, 0.55)
+        dash = var[3] if len(var) > 3 else ("dot" if i == 0 else "dashdot")
         v = dv.set_index("Corner")
         fig.add_trace(
             go.Scatter(
@@ -1576,7 +1614,7 @@ def fig_type_m(
                 y=[ny[c] + k * v.at[c, "Y [mm]"] for c in order],
                 mode="lines",
                 name=lab,
-                line=dict(color=_rgba(C1, 0.55), width=1.5, dash="dot" if i == 0 else "dashdot"),
+                line=dict(color=col, width=2 if len(var) > 2 else 1.5, dash=dash),
                 hovertext=[f"{lab} · {c}: X {v.at[c, 'X [mm]']:+.2f} · Y {v.at[c, 'Y [mm]']:+.2f} mm" for c in order],
                 hoverinfo="text",
             )
@@ -1588,7 +1626,7 @@ def fig_type_m(
             x=[px[c] for c in order],
             y=[py[c] for c in order],
             mode="lines+markers",
-            name="Predicted",
+            name=main_name,
             line=dict(color=C1, width=3),
             marker=dict(size=9, color=C1, line=dict(color="white", width=2)),
             hovertext=[f"{c}: X {d.at[c, 'X [mm]']:+.2f} · Y {d.at[c, 'Y [mm]']:+.2f} mm" for c in order],

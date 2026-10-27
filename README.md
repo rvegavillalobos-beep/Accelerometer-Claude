@@ -45,6 +45,9 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   shift and rotation applied to the Type M nominal corners of the ST020 corner measurement (RICKHARD X), drawn and
   numbered like that app (X towards the front, left corners negative Y, ±3 mm boxes, centroid and rotation angle),
   with an optional μs ± range. The cluster footprint can be set to Type M (1.681 × 1.118 m) in the sidebar.
+- What-if in the whole route (Slip events tab): pick recordings to simulate as fixed (they stay on the route but do not
+  move the cluster); slip events, shift along the route and the Type M module are shown with the fix and compared
+  with the route as measured.
 - Line map tab: the plant layout, the conveyor path and the station positions are embedded in the app. Every
   uploaded recording (one or more) is drawn where its file name says it was measured: `St430-440` as the transport
   along the conveyors in the flow direction (ST 130 → buffer), `St981-Buffer` to the buffer, and a name with one
