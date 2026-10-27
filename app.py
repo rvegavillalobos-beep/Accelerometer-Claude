@@ -157,7 +157,7 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
@@ -776,6 +776,16 @@ with st.sidebar:
             "reach about 0.7 g). A sample with a vertical reading below this value (zero, dropped or inverted data "
             "packet) is removed, however long. 0 = off.",
         )
+        spike_angle = st.toggle(
+            "Yaw: check against the sensor's own angle",
+            value=True,
+            disabled=spike_mode == "off",
+            help="The sensor computes its yaw angle (AngleZ) on the chip and sends it in its own data packet. A burst "
+            "of yaw rate (up to 0.3 s, any number of samples) that rises more than the jump above the normal level "
+            "while the sensor's angle does not turn with it is a corrupted gyro packet: the yaw rate is replaced "
+            "there, the accelerations are left as they are. A real rotation turns the angle too and is always kept. "
+            "Used only when the recording has a live angle channel.",
+        )
 
     with st.expander("4 · Cell cluster", expanded=True):
         mass = st.number_input("Mass [kg]", value=400.0, min_value=1.0, step=10.0)
@@ -982,6 +992,7 @@ pre = asdict(
         spike_max_width=int(spike_width),
         spike_limit_g=float(spike_limit),
         spike_min_vertical_g=float(spike_min_total),
+        spike_angle_check=bool(spike_angle),
     )
 )
 cluster_d = asdict(
@@ -2027,7 +2038,7 @@ with tab_sig, tab_guard("Signals"):
                             "Channel (sensor axes)": ch_,
                             "Value": v_,
                             "Neighbours": n_,
-                            "Unit": "deg/s" if ch_ == "Yaw rate" else "g",
+                            "Unit": "deg/s" if str(ch_).startswith("Yaw rate") else "g",
                         }
                         for t_, ch_, v_, n_ in spikes_
                     ]
@@ -2035,8 +2046,10 @@ with tab_sig, tab_guard("Signals"):
                 hide_index=True,
             )
             st.caption(
-                "Each of these samples was replaced (all channels) by interpolation between its neighbours before the "
-                "simulation. Change the thresholds under Signal processing → Spike filter in the sidebar."
+                "Each of these samples was replaced by interpolation between its neighbours before the simulation: all "
+                "channels, except for 'Yaw rate (sensor angle unchanged)', where only the yaw rate is replaced (the "
+                "sensor's own yaw angle did not turn, the accelerations are valid). Change the thresholds under "
+                "Signal processing → Spike filter in the sidebar."
             )
     elif spike_mode == "on" or (spike_mode == "auto" and kin.fs_native >= 50):
         st.caption("Spike filter on: no isolated spikes found in this recording.")
@@ -2520,6 +2533,15 @@ than gravity; real bumps reach about 0.7 g) and is removed whatever its width. E
 because the data packet is corrupt. The optional hard limit removes every acceleration sample farther than the limit
 from its typical value, whatever its duration. In Auto mode the filter runs only from 50 Hz on: at 10 Hz a real impact
 can be a single sample.
+
+Yaw rate, angle check: the sensor computes its yaw angle (AngleZ) on the chip and sends it in a separate data packet.
+A burst of yaw rate of up to 0.3 s that rises more than the jump threshold above the normal level (median over about
+0.2 s) claims a rotation ∫(ω − normal) dt. If the sensor's angle, over the burst plus about 50 ms on each side, turns by
+less than a quarter of that claimed rotation, the burst did not happen (corrupted gyro packet, often the same value
+repeated in two samples) and the yaw rate is replaced by interpolation there; the accelerations are kept. A real
+rotation turns the angle by the same amount and is never removed. The check runs only when the angle channel is live:
+over the whole recording the angle must account for at least half of the rotation the gyro integrates in blocks of
+about 1 s that turn by more than 2°.
 
 #### Turntable detection
 

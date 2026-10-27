@@ -191,6 +191,8 @@ class PreprocessSettings:
     spike_limit_g: float = 0.0  # 0 = off; acceleration samples farther than this from the typical value are removed
     spike_min_vertical_g: float = 0.3  # 0 = off; a vertical acceleration below this is impossible on a conveyor (the
     # carrier cannot fall faster than gravity): dropped, zero or inverted data packets, removed whatever their width
+    spike_angle_check: bool = True  # yaw-rate jump that the sensor's own yaw angle (AngleZ) does not follow = glitch,
+    # whatever its width (up to SPIKE_ANGLE_MAX_S)
 
 
 @dataclass
@@ -276,6 +278,73 @@ def recording_duration(raw: RawRecording) -> float:
 
 
 SPIKE_CHANNELS = (("ax", "Acceleration X"), ("ay", "Acceleration Y"), ("az", "Acceleration Z"), ("wz", "Yaw rate"))
+YAW_ANGLE_LABEL = "Yaw rate (sensor angle unchanged)"
+SPIKE_ANGLE_MAX_S = 0.3  # longest yaw-rate burst judged by the angle check [s]; real turns last seconds
+
+
+def _angle_channel_trusted(w_dps: np.ndarray, ang_deg: np.ndarray, dt: float) -> bool:
+    """True when the sensor's yaw angle follows the integrated yaw rate over the recording (the channel is live).
+
+    Compared over blocks of about 1 s in which the gyro turns by more than 2 deg: the angle must account for at
+    least half of that rotation in total. A recording without such rotation gives False (nothing to verify against)."""
+    n = len(w_dps)
+    blk = max(5, int(round(1.0 / dt))) if dt > 0 else 0
+    if blk == 0 or n < 2 * blk:
+        return False
+    g = np.concatenate([[0.0], np.cumsum(w_dps[1:] * dt)])
+    idx = np.arange(0, n, blk)
+    dg, da = np.diff(g[idx]), np.diff(ang_deg[idx])
+    big = np.abs(dg) > 2.0
+    if not big.any():
+        return False
+    return float(np.sum(da[big] * np.sign(dg[big]))) >= 0.5 * float(np.sum(np.abs(dg[big])))
+
+
+def find_gyro_glitches(
+    t: np.ndarray, w_dps: np.ndarray, ang_deg, threshold: float, max_s: float = SPIKE_ANGLE_MAX_S
+) -> tuple[np.ndarray, np.ndarray]:
+    """Yaw-rate glitches confirmed by the sensor's own yaw angle.
+
+    The WitMotion sensor computes its yaw angle (AngleZ) on the chip from the gyroscope and sends it in its own data
+    packet. A burst of yaw rate (any width up to max_s) that rises more than threshold above the normal level while the
+    sensor's angle does not turn with it (it explains less than a quarter of the rotation the burst claims) did not
+    happen: a corrupted gyro packet. A real rotation turns the angle by the same amount and is always kept.
+    Returns (mask, normal level). Only used when the angle channel is live over the recording."""
+    n = len(w_dps)
+    base = median_filter(w_dps, size=31, mode="nearest") if n else w_dps
+    mask = np.zeros(n, bool)
+    if ang_deg is None or n < 40 or threshold <= 0:
+        return mask, base
+    a = np.asarray(ang_deg, dtype=float)
+    ok = np.isfinite(a)
+    if ok.sum() < n // 2:
+        return mask, base
+    if not ok.all():
+        a = np.interp(t, t[ok], a[ok])
+    a = np.rad2deg(np.unwrap(np.deg2rad(a)))
+    dtn = np.diff(t)
+    dt = float(np.median(dtn)) if len(dtn) else 0.0
+    if dt <= 0 or not _angle_channel_trusted(w_dps, a, dt):
+        return mask, base
+    dev = w_dps - base
+    cand = np.abs(dev) > threshold
+    if not cand.any():
+        return mask, base
+    max_n = max(1, int(round(max_s / dt)))
+    margin = max(3, int(round(0.05 / dt)))  # the chip's angle may lag the gyro by a few samples
+    edges = np.diff(np.r_[0, cand.astype(np.int8), 0])
+    for i0, i1 in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
+        if i1 - i0 > max_n:
+            continue
+        claimed = float(np.sum(dev[i0:i1]) * dt)  # rotation the burst adds to the normal level [deg]
+        if abs(claimed) < 0.3:  # too small to judge against the angle resolution
+            continue
+        lo, hi = max(i0 - margin, 0), min(i1 - 1 + margin, n - 1)
+        normal = float(np.sum(base[lo + 1 : hi + 1]) * dt)
+        explained = (a[hi] - a[lo] - normal) / claimed
+        if explained < 0.25:
+            mask[i0:i1] = True
+    return mask, base
 
 
 def find_spikes(x: np.ndarray, threshold: float, max_width: int = 1) -> tuple[np.ndarray, np.ndarray]:
@@ -303,10 +372,12 @@ def find_spikes(x: np.ndarray, threshold: float, max_width: int = 1) -> tuple[np
     return mask, med
 
 
-def remove_spikes(t: np.ndarray, ch: dict[str, np.ndarray], s: PreprocessSettings) -> list:
+def remove_spikes(t: np.ndarray, ch: dict[str, np.ndarray], s: PreprocessSettings, angle_z_deg=None) -> list:
     """Replace isolated glitches in place by linear interpolation. The whole sample (all channels) is replaced:
-    a glitch is a corrupted data packet. Returns (t [s], channel, value, value of the neighbours) per glitch."""
+    a glitch is a corrupted data packet. Yaw-rate glitches found by the angle check replace the yaw rate only (the
+    sensor sends the gyro in its own packet). Returns (t [s], channel, value, value of the neighbours) per glitch."""
     union = np.zeros(len(t), bool)
+    gyro_only = np.zeros(len(t), bool)
     best: dict[int, tuple] = {}  # sample -> (score, channel, value, neighbours)
     for key, label in SPIKE_CHANNELS:
         gyro = key == "wz"
@@ -334,11 +405,26 @@ def remove_spikes(t: np.ndarray, ch: dict[str, np.ndarray], s: PreprocessSetting
                 if i not in best or score > best[i][0]:
                     best[i] = (score, "Acceleration Z (dropout)", float(ch["az"][i]), ref)
             union |= low
-    keep = ~union
-    if not union.any() or keep.sum() < 2:
+    if s.spike_angle_check and angle_z_deg is not None:
+        wz_c = ch["wz"].copy()
+        if union.any() and (~union).sum() >= 2:  # judge the bursts without the glitches already found
+            wz_c[union] = np.interp(t[union], t[~union], wz_c[~union])
+        wd = np.rad2deg(wz_c)
+        gm, gbase = find_gyro_glitches(t, wd, angle_z_deg, s.spike_gyro_dps)
+        gm &= ~union
+        for i in np.where(gm)[0]:
+            best[i] = (abs(wd[i] - gbase[i]) / max(s.spike_gyro_dps, 1e-9), YAW_ANGLE_LABEL, float(wd[i]), float(gbase[i]))
+        gyro_only |= gm
+    if not (union.any() or gyro_only.any()):
         return []
-    for key, _label in SPIKE_CHANNELS:
-        ch[key][union] = np.interp(t[union], t[keep], ch[key][keep])
+    keep = ~union
+    if union.any() and keep.sum() >= 2:
+        for key, _label in SPIKE_CHANNELS:
+            if key != "wz":
+                ch[key][union] = np.interp(t[union], t[keep], ch[key][keep])
+    gbad = union | gyro_only
+    if (~gbad).sum() >= 2:
+        ch["wz"][gbad] = np.interp(t[gbad], t[~gbad], ch["wz"][~gbad])
     return [(round(float(t[i]), 4), best[i][1], round(best[i][2], 3), round(best[i][3], 3)) for i in sorted(best)]
 
 
@@ -367,13 +453,16 @@ def preprocess(raw: RawRecording, s: PreprocessSettings) -> Kinematics:
     fs_est = 1.0 / float(np.median(dtn)) if len(dtn) and np.median(dtn) > 0 else 0.0
     if s.spike_mode == "on" or (s.spike_mode == "auto" and fs_est >= 50.0):
         ch = {"ax": ax, "ay": ay, "az": az, "wz": wz}
-        spikes = remove_spikes(t_native, ch, s)
+        ang = df["yaw"].to_numpy(float) if "yaw" in df.columns else None
+        spikes = remove_spikes(t_native, ch, s, ang)
         ax, ay, az, wz = ch["ax"], ch["ay"], ch["az"], ch["wz"]
         if spikes:
             worst = max(
-                spikes, key=lambda r: abs(r[2] - r[3]) / (s.spike_gyro_dps if r[1] == "Yaw rate" else max(s.spike_acc_g, 0.1))
+                spikes,
+                key=lambda r: abs(r[2] - r[3])
+                / (s.spike_gyro_dps if r[1].startswith("Yaw rate") else max(s.spike_acc_g, 0.1)),
             )
-            unit = "deg/s" if worst[1] == "Yaw rate" else "g"
+            unit = "deg/s" if worst[1].startswith("Yaw rate") else "g"
             warnings.append(
                 f"{len(spikes)} isolated spike(s) removed by the spike filter (largest: {worst[1].lower()} "
                 f"{worst[2]:.2f} {unit} where its neighbours read {worst[3]:.2f} {unit}). See the Signals tab."
