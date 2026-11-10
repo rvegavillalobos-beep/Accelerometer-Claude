@@ -160,7 +160,7 @@ from visuals import (
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 
 # Top-view animation tab: what it shows
 ANIM_PLAY = "Animation"
@@ -169,7 +169,7 @@ ANIM_SNAP = "Event snapshot (one frozen frame)"
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
 _CALC_MODULES = ("data_io.py", "slip_model.py", "turns.py", "motion.py")
-_CACHE_FORMAT = b"plain-records-v2"  # bump when the layout of cached values changes
+_CACHE_FORMAT = b"plain-records-v3"  # bump when the layout of cached values changes
 CACHE_V = hashlib.md5(
     _CACHE_FORMAT
     + b"".join(Path(__file__).with_name(f).read_bytes() for f in _CALC_MODULES if Path(__file__).with_name(f).exists())
@@ -356,6 +356,11 @@ def tab_guard(tab_name: str):
             st.exception(exc)
 
 
+def clock_s(clock, t_s) -> str:
+    """Clock time followed by the seconds from the recording start, the time axis of the charts."""
+    return f"{clock} ({float(t_s):.2f} s)"
+
+
 def fmt_clock(ts) -> str:
     return pd.Timestamp(ts).strftime("%H:%M:%S.%f")[:-3]
 
@@ -386,7 +391,8 @@ def _compute_compare_row(data, name, pre, cluster, contact, sensor, solver, turn
         "Required μ (no slip)": round(s_i["mu_noslip"], 3),
         "Margin vs μs": f"{(s_i['margin'] - 1) * 100:+.0f}%",
         "Exceedances of μs": len(pk_i),
-        "Exceedance times": ", ".join(pk_i["Clock"].tolist()[:12]) + (" …" if len(pk_i) > 12 else ""),
+        "Exceedance times": ", ".join(clock_s(c, t_) for c, t_ in list(zip(pk_i["Clock"], pk_i["Time [s]"]))[:12])
+        + (" …" if len(pk_i) > 12 else ""),
         "Slip events": s_i["n_events"],
         "Slip time [s]": round(s_i["slip_time_s"], 2),
         "Final max corner shift [mm]": round(s_i["final_corner_mm"], 2),
@@ -1196,7 +1202,7 @@ if res.truncated:
 if sm["n_events"] == 0:
     st.success(
         f"**No slip predicted.** The highest friction demand in this record is μ = {sm['mu_noslip']:.3f} "
-        f"({crit.iloc[0]['Clock'] if len(crit) else '-'}); available μs = {mu_s:.3f} → margin {sm['margin'] - 1:+.0%}."
+        f"({clock_s(crit.iloc[0]['Clock'], crit.iloc[0]['Time [s]']) if len(crit) else '-'}); available μs = {mu_s:.3f} → margin {sm['margin'] - 1:+.0%}."
     )
 elif sm["final_corner_mm"] > tol_mm or sm["peak_corner_mm"] > tol_mm:
     st.error(
@@ -1998,7 +2004,7 @@ def snapshot_moments() -> list[dict]:
         shift = float(ev["Max corner shift [mm]"])
         out.append(
             {
-                "label": f"Slip #{int(ev['Event'])} · {ev['Start clock']} · {shift:.2f} mm · {phase}",
+                "label": f"Slip #{int(ev['Event'])} · {clock_s(ev['Start clock'], ev['Start [s]'])} · {shift:.2f} mm · {phase}",
                 "title": f"Slip event #{int(ev['Event'])}",
                 "t0": float(ev["Start [s]"]),
                 "t1": float(ev["End [s]"]),
@@ -2016,7 +2022,7 @@ def snapshot_moments() -> list[dict]:
         phase, where = str(cm.get("Motion phase", "")), str(cm.get("Conveyor context", ""))
         out.append(
             {
-                "label": f"Critical moment · {cm['Clock']} · μ {float(cm['Required mu']):.3f} · no slip · {phase}",
+                "label": f"Critical moment · {clock_s(cm['Clock'], cm['Time [s]'])} · μ {float(cm['Required mu']):.3f} · no slip · {phase}",
                 "title": "Critical moment (no slip)",
                 "t0": float(cm["Time [s]"]),
                 "t1": float(cm["Time [s]"]),
@@ -2355,9 +2361,13 @@ with tab_ev, tab_guard("Slip events"):
         else:
             st.dataframe(events_view, hide_index=True)
             labels = [
-                f"#{n} · {c} · {d:.3f} s · {pv}"
-                for n, c, d, pv in zip(
-                    res.events["Event"], res.events["Start clock"], res.events["Duration [s]"], res.events["Pivot"]
+                f"#{n} · {clock_s(c, t_)} · lasts {d:.3f} s · {pv}"
+                for n, c, t_, d, pv in zip(
+                    res.events["Event"],
+                    res.events["Start clock"],
+                    res.events["Start [s]"],
+                    res.events["Duration [s]"],
+                    res.events["Pivot"],
                 )
             ]
             sel = st.selectbox("Event detail", labels)
@@ -2395,9 +2405,9 @@ with tab_ev, tab_guard("Slip events"):
             moments = []
             if not res.events.empty:
                 for n, c, t_ in zip(res.events["Event"], res.events["Start clock"], res.events["Start [s]"]):
-                    moments.append((f"Slip event #{n} · {c}", float(t_)))
+                    moments.append((f"Slip event #{n} · {clock_s(c, t_)}", float(t_)))
             for c, t_, m_ in zip(crit["Clock"], crit["Time [s]"], crit["Required mu"]):
-                moments.append((f"Critical moment · {c} · μ {m_:.3f}", float(t_)))
+                moments.append((f"Critical moment · {clock_s(c, t_)} · μ {m_:.3f}", float(t_)))
             if moments:
                 choice = st.selectbox("Jump to", [m[0] for m in moments])
                 t_sel = dict(moments)[choice]
@@ -2495,7 +2505,7 @@ def render_line_map(cmp_df: pd.DataFrame, peaks_map: dict, mu_s: float) -> None:
         geo = section_geometry(row)
         pk = peaks_map.get(rec)
         n = 0 if pk is None else len(pk)
-        times = [] if pk is None or not len(pk) else [str(c) for c in pk["Clock"].tolist()]
+        times = [] if pk is None or not len(pk) else [clock_s(c, t_) for c, t_ in zip(pk["Clock"], pk["Time [s]"])]
         mu_max = float(row_of[rec]["Required μ (no slip)"]) if rec in row_of else float("nan")
         if not geo["path"]:
             unmapped.append((rec, geo))
