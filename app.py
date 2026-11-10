@@ -44,6 +44,7 @@ _LOCAL_MODULES = (
     "line_layout",
     "whole_route",
     "type_m",
+    "impact",
     "visuals",
 )
 
@@ -122,6 +123,7 @@ from type_m import (
     corner_deviations,
     placement,
 )
+from impact import SnapshotSettings, analyse_event, default_gyration
 from turns import (
     TurnSettings,
     analyse_rotations,
@@ -154,10 +156,15 @@ from visuals import (
     fig_speed_ramps,
     fig_speed_timeline,
     fig_topview,
+    fig_event_snapshot,
     fig_turn_profiles,
 )
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
+
+# Top-view animation tab: what it shows
+ANIM_PLAY = "Animation"
+ANIM_SNAP = "Event snapshot (one frozen frame)"
 
 # Cached results are keyed on a fingerprint of the calculation modules, so a code update never reuses
 # objects computed by an older version of the app (Streamlit Cloud keeps its cache across redeploys).
@@ -1159,6 +1166,7 @@ anim_key = f"anim_{active}_{t_lo:.1f}_{t_hi:.1f}"
 
 def _show_in_animation(a: float, b: float):
     st.session_state[anim_key] = (float(np.clip(round(a, 1), t_lo, t_hi)), float(np.clip(round(b, 1), t_lo, t_hi)))
+    st.session_state["anim_mode"] = ANIM_PLAY
 
 
 def _use_axis_as_sensor(x: float, y: float):
@@ -1978,120 +1986,284 @@ with tab_speed, tab_guard("Speed profile"):
         st.info("No reliable motion segment in this record.")
 
 # --------------------------------------------------------------------------- #
+# Event snapshot (Top-view animation tab)
+# --------------------------------------------------------------------------- #
+def snapshot_moments() -> list[dict]:
+    """Slip events of the active recording, then its critical moments without slip."""
+    out: list[dict] = []
+    for i in range(len(res.events)):
+        ev = res.events.iloc[i]
+        phase = str(events_view.iloc[i].get("Motion phase", ""))
+        where = str(events_view.iloc[i].get("Conveyor context", ""))
+        shift = float(ev["Max corner shift [mm]"])
+        out.append(
+            {
+                "label": f"Slip #{int(ev['Event'])} · {ev['Start clock']} · {shift:.2f} mm · {phase}",
+                "title": f"Slip event #{int(ev['Event'])}",
+                "t0": float(ev["Start [s]"]),
+                "t1": float(ev["End [s]"]),
+                "shift": shift,
+                "mu": float(ev["Peak mu required"]),
+                "pivot": (float(ev["Pivot X [m]"]), float(ev["Pivot Y [m]"])),
+                "pivot_label": str(ev["Pivot"]),
+                "context": f"Carrier: {phase}<br>Conveyor: {where}",
+                "slip": True,
+            }
+        )
+    for _, cm in crit.iterrows():
+        if str(cm.get("Predicted slip", "No")) == "Yes":
+            continue  # already listed as a slip event
+        phase, where = str(cm.get("Motion phase", "")), str(cm.get("Conveyor context", ""))
+        out.append(
+            {
+                "label": f"Critical moment · {cm['Clock']} · μ {float(cm['Required mu']):.3f} · no slip · {phase}",
+                "title": "Critical moment (no slip)",
+                "t0": float(cm["Time [s]"]),
+                "t1": float(cm["Time [s]"]),
+                "shift": 0.0,
+                "mu": float(cm["Required mu"]),
+                "pivot": None,
+                "pivot_label": "",
+                "context": f"Carrier: {phase}<br>Conveyor: {where}",
+                "slip": False,
+            }
+        )
+    return out
+
+
+def render_event_snapshot() -> None:
+    """Pick a slip event and show it frozen in one frame: push on the carrier, hit point, cluster movement."""
+    moments = snapshot_moments()
+    if not moments:
+        st.info("No slip event and no critical moment in this recording.")
+        return
+    n_slip = sum(m["slip"] for m in moments)
+    c1, c2, c3, c4 = st.columns([1.4, 4.2, 0.8, 0.8], vertical_alignment="bottom")
+    order = c1.selectbox("Order", ["Time", "Largest corner shift", "Highest required μ"], key="snap_order")
+    if order == "Largest corner shift":
+        moments = sorted(moments, key=lambda m: -m["shift"])
+    elif order == "Highest required μ":
+        moments = sorted(moments, key=lambda m: -m["mu"])
+    labels = [m["label"] for m in moments]
+    sel_key = f"snap_sel_{active}"
+    if st.session_state.get(sel_key) not in labels:
+        st.session_state[sel_key] = max(moments, key=lambda m: m["shift"])["label"]  # largest slip event
+
+    def _step(step: int, key=sel_key, labels=labels):
+        cur = st.session_state.get(key)
+        i = labels.index(cur) if cur in labels else 0
+        st.session_state[key] = labels[int(np.clip(i + step, 0, len(labels) - 1))]
+
+    sel = c2.selectbox(
+        f"Event ({n_slip} slip event{'s' if n_slip != 1 else ''}, {len(moments) - n_slip} critical moments without slip)",
+        labels,
+        key=sel_key,
+    )
+    pos = labels.index(sel)
+    c3.button("◀ Previous", on_click=_step, args=(-1,), disabled=pos == 0, key="snap_prev")
+    c4.button("Next ▶", on_click=_step, args=(1,), disabled=pos == len(labels) - 1, key="snap_next")
+    m = moments[pos]
+
+    with st.expander("Estimate settings", expanded=False):
+        g1, g2, g3 = st.columns(3)
+        k_gyr = g1.number_input(
+            "Radius of gyration of the loaded carrier [m]",
+            value=round(default_gyration(res.cluster), 2),
+            min_value=0.05,
+            max_value=10.0,
+            step=0.05,
+            help="Used to place the line of action of the push: distance from the centre = k² · yaw jolt / speed "
+            "change. The default is a uniform plate with the GOT outline. A larger value moves the hit point "
+            "further from the centre.",
+        )
+        shock_ms = g2.number_input(
+            "Longest pulse that counts as a hit [ms]",
+            value=120,
+            min_value=20,
+            max_value=1000,
+            step=10,
+            help="Width of the acceleration pulse at half its peak. A shorter pulse is a hit, a longer one a start "
+            "or braking ramp. Never below 1.5 samples of the recording.",
+        )
+        auto_k = g3.toggle("Auto magnification", value=True, key="snap_auto_k")
+        k_val = g3.number_input(
+            "Movement magnification ×", value=50.0, min_value=1.0, max_value=5000.0, step=1.0, disabled=auto_k, key="snap_k"
+        )
+
+    snap = analyse_event(
+        kin,
+        res,
+        m["t0"],
+        m["t1"],
+        gyration=float(k_gyr),
+        pivot=m["pivot"],
+        pivot_label=m["pivot_label"],
+        s=SnapshotSettings(shock_max_s=float(shock_ms) / 1e3),
+    )
+    st.plotly_chart(
+        fig_event_snapshot(
+            kin,
+            res,
+            snap,
+            title=m["title"],
+            context=m["context"],
+            travel=travel,
+            magnification=None if auto_k else float(k_val),
+        ),
+        config=PLOT_CONFIG,
+        key="snap_fig",
+    )
+    st.caption(
+        "Frozen at the peak of the event, seen from above with the GOT fixed. Red arrow and star = push on the carrier "
+        "and the point where it enters the GOT outline (grey without star when the load is a ramp or a turntable, not "
+        "a hit); the dashed line is its line of action, the contact is somewhere on that line. Orange arrow = inertial "
+        "load on the cluster, the dotted circle = friction limit at that instant on the same scale: an arrow beyond "
+        "the circle means slip. Blue = predicted movement of the cluster in this event only, magnified; the numbers "
+        "are the true shifts in mm. The cluster is drawn from its nominal position, shifts of earlier events are not "
+        "shown. The side of a hit is reliable; the position along the side comes from how much the carrier twisted, "
+        "and a carrier held by side guides twists less than a free one, so it tends towards the middle. These are "
+        "estimates from the sensor on the carrier: check them against the video."
+    )
+    st.button(
+        "▶ Play this event in the animation",
+        on_click=_show_in_animation,
+        args=(m["t0"] - 3.0, m["t1"] + 3.0),
+        key="snap_play",
+    )
+    with st.expander("Signals around this event", expanded=False):
+        pad_s = max(1.0, 2.0 * (m["t1"] - m["t0"]))
+        e0 = max(float(kin.t[0]), m["t0"] - pad_s)
+        e1 = min(float(kin.t[-1]), m["t1"] + pad_s)
+        st.plotly_chart(fig_friction(res, e0, e1), config=PLOT_CONFIG, key="snap_friction")
+        st.plotly_chart(fig_kinematics(kin, res, e0, e1), config=PLOT_CONFIG, key="snap_kin")
+
+
+# --------------------------------------------------------------------------- #
 # Animation
 # --------------------------------------------------------------------------- #
 with tab_anim, tab_guard("Top-view animation"):
-    if len(res.events):
-        ev = res.events.iloc[int(np.argmax(res.events["Max corner shift [mm]"].to_numpy()))]
-        centre = 0.5 * (ev["Start [s]"] + ev["End [s]"])
-    elif len(crit):
-        centre = float(crit.iloc[0]["Time [s]"])
+    anim_mode = st.radio(
+        "Show",
+        [ANIM_PLAY, ANIM_SNAP],
+        horizontal=True,
+        key="anim_mode",
+        help="Animation: the cluster moving over a time window. Event snapshot: one slip event frozen in a single "
+        "frame, with the push on the carrier, the estimated hit point and the predicted cluster movement as vectors.",
+    )
+    if anim_mode == ANIM_SNAP:
+        render_event_snapshot()
     else:
-        centre = t_lo
-    d0 = (max(t_lo, centre - 15.0), min(t_hi, centre + 15.0))
-    c1, c2, c3, c4 = st.columns([3, 1.3, 1.2, 1.2])
-    if anim_key not in st.session_state:
-        st.session_state[anim_key] = (
-            float(np.clip(round(d0[0], 1), t_lo, t_hi)),
-            float(np.clip(round(d0[1], 1), t_lo, t_hi)),
-        )
-    a_win = c1.slider(
-        "Animation window [s]",
-        min_value=t_lo,
-        max_value=t_hi,
-        step=0.1,
-        key=anim_key,
-        help="Defaults to ±15 s around the largest slip event, or around the most critical moment.",
-    )
-    view = c2.radio("View", ["Carrier (GOT fixed)", "Plant (carrier rotates)"], key="view")
-    play_speed = c3.selectbox(
-        "Playback speed", [0.25, 0.5, 1.0, 2.0, 5.0, 10.0], index=2, format_func=lambda v: f"{v:g}×"
-    )
-    nfr = c4.selectbox("Max. frames", [300, 600, 1000], index=1)
-    sl = slice(int(np.searchsorted(res.t, a_win[0])), int(np.searchsorted(res.t, a_win[1], side="right")))
-    k_auto = auto_exaggeration(res, slice(0, len(res.t)))
-    c1, c2 = st.columns([1, 3])
-    auto_k = c1.toggle(
-        "Auto magnification",
-        value=True,
-        help="Displacements are millimetres on a metre-sized part; they are magnified for visibility.",
-    )
-    k_val = c2.number_input(
-        "Displacement magnification ×", value=float(k_auto), min_value=1.0, max_value=5000.0, step=1.0, disabled=auto_k
-    )
-    k_use = k_auto if auto_k else float(k_val)
-    if a_win[1] - a_win[0] < 0.2:
-        st.info("Select a window of at least 0.2 s.")
-    else:
-        st.plotly_chart(
-            fig_topview(
-                kin,
-                res,
-                a_win[0],
-                a_win[1],
-                exaggeration=k_use,
-                plant_view=view.startswith("Plant"),
-                max_frames=int(nfr),
-                playback_speed=float(play_speed),
-                travel=travel,
-            ),
-            config=PLOT_CONFIG,
-            key="anim",
-        )
-        st.caption(
-            "Blue = cluster sticking, red = sliding. Violet arrow outside the GOT = direction in which the carrier "
-            "travels (grey when the direction is uncertain). Orange arrow = direction in which inertia pushes the "
-            "cluster relative to the GOT (length ∝ load; 0.25 g reaches half the cluster width): it points backwards "
-            "while the carrier speeds up and forwards while it brakes. × = instantaneous pivot while sliding. "
-            "The GOT outline is schematic."
-        )
-        with st.expander("Travel direction per motion segment (auto-detected, editable)"):
-            st.caption(
-                "Each row is a period in which the carrier rolls on the conveyor. The direction comes from the velocity "
-                "after the start and before the stop; 'High' means both agree. If you know the real direction (e.g. from "
-                "the video), set it in the Direction column; it is used in the animation and in the Motion phase columns."
+        if len(res.events):
+            ev = res.events.iloc[int(np.argmax(res.events["Max corner shift [mm]"].to_numpy()))]
+            centre = 0.5 * (ev["Start [s]"] + ev["End [s]"])
+        elif len(crit):
+            centre = float(crit.iloc[0]["Time [s]"])
+        else:
+            centre = t_lo
+        d0 = (max(t_lo, centre - 15.0), min(t_hi, centre + 15.0))
+        c1, c2, c3, c4 = st.columns([3, 1.3, 1.2, 1.2])
+        if anim_key not in st.session_state:
+            st.session_state[anim_key] = (
+                float(np.clip(round(d0[0], 1), t_lo, t_hi)),
+                float(np.clip(round(d0[1], 1), t_lo, t_hi)),
             )
-            seg_keys = [segment_key(g) for g in motion_segs]
-            ed_key = f"travel_ed_{active}_" + hashlib.md5("|".join(seg_keys).encode()).hexdigest()[:10]
-
-            def _save_travel_overrides(ed_key=ed_key, ov_key=travel_ov_key, seg_keys=seg_keys):
-                edits = (st.session_state.get(ed_key) or {}).get("edited_rows", {})
-                ov = dict(st.session_state.get(ov_key, {}))
-                for row, change in edits.items():
-                    if "Direction" in change and int(row) < len(seg_keys):
-                        ov[seg_keys[int(row)]] = change["Direction"]
-                st.session_state[ov_key] = ov
-
-            def _reset_travel_overrides(ed_key=ed_key, ov_key=travel_ov_key):
-                st.session_state[ov_key] = {}
-                if ed_key in st.session_state:
-                    del st.session_state[ed_key]
-
-            seg_df = segments_table(motion_segs, travel_overrides)
-            if seg_df.empty:
-                st.info(
-                    "No motion segment detected. Lower the rolling-vibration threshold in the sidebar (8 · Travel direction)."
-                )
-            else:
-                st.data_editor(
-                    seg_df,
-                    key=ed_key,
-                    on_change=_save_travel_overrides,
-                    hide_index=True,
-                    disabled=[c for c in seg_df.columns if c != "Direction"],
-                    column_config={
-                        "Direction": st.column_config.SelectboxColumn(
-                            "Direction", options=["Auto", *DIRECTIONS.keys(), "Stopped"], required=True
-                        )
-                    },
-                )
-                st.button("Reset manual directions", on_click=_reset_travel_overrides)
-        st.plotly_chart(fig_motion(res, tol_mm, a_win[0], a_win[1]), config=PLOT_CONFIG, key="anim_motion")
-        st.markdown("##### Corner paths in the animation window")
-        st.caption(
-            "Each panel sits where the corner is on the cluster (Front to the right, Left at the top). A corner that barely moves while the others travel indicates pivoting about that corner."
+        a_win = c1.slider(
+            "Animation window [s]",
+            min_value=t_lo,
+            max_value=t_hi,
+            step=0.1,
+            key=anim_key,
+            help="Defaults to ±15 s around the largest slip event, or around the most critical moment.",
         )
-        st.plotly_chart(fig_corner_paths(res, a_win[0], a_win[1]), config=PLOT_CONFIG, key="anim_corners")
+        view = c2.radio("View", ["Carrier (GOT fixed)", "Plant (carrier rotates)"], key="view")
+        play_speed = c3.selectbox(
+            "Playback speed", [0.25, 0.5, 1.0, 2.0, 5.0, 10.0], index=2, format_func=lambda v: f"{v:g}×"
+        )
+        nfr = c4.selectbox("Max. frames", [300, 600, 1000], index=1)
+        sl = slice(int(np.searchsorted(res.t, a_win[0])), int(np.searchsorted(res.t, a_win[1], side="right")))
+        k_auto = auto_exaggeration(res, slice(0, len(res.t)))
+        c1, c2 = st.columns([1, 3])
+        auto_k = c1.toggle(
+            "Auto magnification",
+            value=True,
+            help="Displacements are millimetres on a metre-sized part; they are magnified for visibility.",
+        )
+        k_val = c2.number_input(
+            "Displacement magnification ×", value=float(k_auto), min_value=1.0, max_value=5000.0, step=1.0, disabled=auto_k
+        )
+        k_use = k_auto if auto_k else float(k_val)
+        if a_win[1] - a_win[0] < 0.2:
+            st.info("Select a window of at least 0.2 s.")
+        else:
+            st.plotly_chart(
+                fig_topview(
+                    kin,
+                    res,
+                    a_win[0],
+                    a_win[1],
+                    exaggeration=k_use,
+                    plant_view=view.startswith("Plant"),
+                    max_frames=int(nfr),
+                    playback_speed=float(play_speed),
+                    travel=travel,
+                ),
+                config=PLOT_CONFIG,
+                key="anim",
+            )
+            st.caption(
+                "Blue = cluster sticking, red = sliding. Violet arrow outside the GOT = direction in which the carrier "
+                "travels (grey when the direction is uncertain). Orange arrow = direction in which inertia pushes the "
+                "cluster relative to the GOT (length ∝ load; 0.25 g reaches half the cluster width): it points backwards "
+                "while the carrier speeds up and forwards while it brakes. × = instantaneous pivot while sliding. "
+                "The GOT outline is schematic."
+            )
+            with st.expander("Travel direction per motion segment (auto-detected, editable)"):
+                st.caption(
+                    "Each row is a period in which the carrier rolls on the conveyor. The direction comes from the velocity "
+                    "after the start and before the stop; 'High' means both agree. If you know the real direction (e.g. from "
+                    "the video), set it in the Direction column; it is used in the animation and in the Motion phase columns."
+                )
+                seg_keys = [segment_key(g) for g in motion_segs]
+                ed_key = f"travel_ed_{active}_" + hashlib.md5("|".join(seg_keys).encode()).hexdigest()[:10]
+
+                def _save_travel_overrides(ed_key=ed_key, ov_key=travel_ov_key, seg_keys=seg_keys):
+                    edits = (st.session_state.get(ed_key) or {}).get("edited_rows", {})
+                    ov = dict(st.session_state.get(ov_key, {}))
+                    for row, change in edits.items():
+                        if "Direction" in change and int(row) < len(seg_keys):
+                            ov[seg_keys[int(row)]] = change["Direction"]
+                    st.session_state[ov_key] = ov
+
+                def _reset_travel_overrides(ed_key=ed_key, ov_key=travel_ov_key):
+                    st.session_state[ov_key] = {}
+                    if ed_key in st.session_state:
+                        del st.session_state[ed_key]
+
+                seg_df = segments_table(motion_segs, travel_overrides)
+                if seg_df.empty:
+                    st.info(
+                        "No motion segment detected. Lower the rolling-vibration threshold in the sidebar (8 · Travel direction)."
+                    )
+                else:
+                    st.data_editor(
+                        seg_df,
+                        key=ed_key,
+                        on_change=_save_travel_overrides,
+                        hide_index=True,
+                        disabled=[c for c in seg_df.columns if c != "Direction"],
+                        column_config={
+                            "Direction": st.column_config.SelectboxColumn(
+                                "Direction", options=["Auto", *DIRECTIONS.keys(), "Stopped"], required=True
+                            )
+                        },
+                    )
+                    st.button("Reset manual directions", on_click=_reset_travel_overrides)
+            st.plotly_chart(fig_motion(res, tol_mm, a_win[0], a_win[1]), config=PLOT_CONFIG, key="anim_motion")
+            st.markdown("##### Corner paths in the animation window")
+            st.caption(
+                "Each panel sits where the corner is on the cluster (Front to the right, Left at the top). A corner that barely moves while the others travel indicates pivoting about that corner."
+            )
+            st.plotly_chart(fig_corner_paths(res, a_win[0], a_win[1]), config=PLOT_CONFIG, key="anim_corners")
 
 # --------------------------------------------------------------------------- #
 # Signals
@@ -2638,6 +2810,35 @@ threshold. For each rolling period the velocity is integrated only over a short 
 offsets. When both windows give the same direction the confidence is *High*. The direction is snapped to the
 carrier axes (±X, ±Y) and can be overridden manually. The **Motion phase** column then tells whether a load
 occurred while the carrier was accelerating, braking / stopping, or as a lateral load.
+
+#### Event snapshot and hit estimate (Top-view animation tab)
+
+The snapshot freezes one slip event (or a critical moment without slip) at the peak of the horizontal acceleration
+of the carrier and draws everything as vectors in one frame.
+
+**Hit or ramp.** The width of the acceleration pulse at half its peak is its duration. A pulse of up to 120 ms
+(adjustable, never below 1.5 samples of the recording) is a hit: stopper, transfer, another carrier. A longer one is
+a start or braking ramp of the conveyor, or the load of a turntable.
+
+**Where the hit acted.** The horizontal acceleration of the carrier is the net horizontal force on it divided by
+its mass, so its direction is the direction of the push: a stopper that brakes a carrier pushes it backwards and
+acts on its front. A push that does not pass through the centre also twists the carrier. Over the pulse the push
+changes the speed by Δv and the yaw rate by Δω, and it acts along the line at the distance
+
+&nbsp;&nbsp;&nbsp;&nbsp;h = k² · Δω / |Δv|
+
+from the centre of the GOT (k = radius of gyration of the loaded carrier, by default that of a uniform plate with the
+GOT outline). Δω is read from the gyroscope before and after the pulse, Δv is the integral of the acceleration over
+the same interval. The hit point is where that line enters the GOT outline on the side the force comes from. The
+sensor only gives the line: a stopper that acts under the carrier sits somewhere on it. A carrier held by side
+guides cannot yaw freely, so an off-centre hit twists it less than the formula assumes: the side (front, rear, left,
+right) is reliable, the position along the side tends towards the middle. When the line passes outside the GOT the
+carrier was mostly twisted and there is no single hit point.
+
+**Movement.** The blue arrows are the shift of each corner and of the centre of mass predicted by the stick-slip
+model between the start and the end of that event, magnified; the labels are the true values. The orange arrow is
+the inertial load on the cluster at the peak friction demand (it points against the acceleration of the carrier),
+drawn on the same scale as the friction limit circle μs·f_z.
 
 #### Dynamic friction limit
 

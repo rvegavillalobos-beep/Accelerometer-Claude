@@ -32,6 +32,12 @@ It predicts **when** the cluster slips, **how far** it moves, **how much it rota
   every critical moment (accelerating, braking / stop, lateral load, stopped, rotating on turntable).
 - Animated top view (carrier or plant frame) with travel-direction arrow, friction demand vs. capacity,
   slip-event table with pivot location.
+- Event snapshot (Top-view animation tab): pick any slip event, or a critical moment without slip, and see it frozen
+  in one frame with vectors: the push on the carrier with its line of action and the estimated hit point (which side
+  or corner, from the direction of the acceleration and the yaw jolt of the carrier), hit vs. start / braking ramp
+  (pulse duration), the inertial load on the cluster against the friction limit, and the predicted movement of every
+  corner and of the centre of mass with the true shifts in mm, rotation and pivot. Previous / next buttons step
+  through the events; one click plays the event in the animation.
 - Measure tab: pick a zoom window on the whole-record strip, then measure an interval A–B at full resolution
   (recorded samples shown, A and B adjustable to the millisecond) with Δt, clock times, distance, mean speed,
   carrier rotation, maximum friction demand and slip.
@@ -77,7 +83,8 @@ Push the repository to GitHub, create a new app and select `app.py` as the entry
 | `slip_model.py` | Friction contact model, stick-slip simulation, event extraction |
 | `turns.py` | Turntable / rotation detection and analysis |
 | `motion.py` | Travel direction and motion phase of the carrier |
-| `visuals.py` | Plotly figures and the animated top view |
+| `impact.py` | Event snapshot: hit or ramp, line of action and hit point of the push, movement of one event |
+| `visuals.py` | Plotly figures, the animated top view and the event snapshot |
 | `whole_route.py` | Shifts of all recordings added up along the line, effective μ from a measured shift |
 | `type_m.py` | Type M nominal corners (ST020) and the predicted corner deviations, centroid and rotation angle |
 | `line_layout.py` | File names → line sections, shortest way along the conveyors, loops |

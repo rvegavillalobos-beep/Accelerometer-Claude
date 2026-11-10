@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from data_io import Kinematics
+from impact import KIND_WEAK, EventSnapshot, summary_lines
 from motion import STATE_MOVING, STATE_ROTATING, STATE_UNKNOWN
 from slip_model import CORNER_NAMES, SimulationResult, vertical_factor
 
@@ -642,6 +643,367 @@ def fig_topview(
                 ],
             )
         ],
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Event snapshot (one frozen frame with the vectors of a slip event)
+# --------------------------------------------------------------------------- #
+def event_magnification(res: SimulationResult, snap: EventSnapshot) -> float:
+    """Magnification that makes the cluster movement of one event visible (about 12 % of the shorter side)."""
+    peak = float(snap.corner_shift_mm.max()) * 1e-3
+    if peak <= 1e-6:
+        return 1.0
+    k = 0.12 * min(res.cluster.length, res.cluster.width) / peak
+    return float(np.clip(np.round(k), 1, 2000))
+
+
+def _anchors(ux: float, uy: float) -> dict:
+    """Text anchors for a label placed in the direction (ux, uy) from what it describes."""
+    return dict(
+        xanchor="left" if ux > 0.3 else ("right" if ux < -0.3 else "center"),
+        yanchor="bottom" if uy > 0.3 else ("top" if uy < -0.3 else "middle"),
+    )
+
+
+def _vector(fig: go.Figure, p0, p1, color: str, width: float = 3.0, head: float = 1.0, standoff: int = 0) -> None:
+    """Arrow from p0 to p1 in data coordinates (standoff: pixels left free before p1)."""
+    fig.add_annotation(
+        x=float(p1[0]),
+        y=float(p1[1]),
+        ax=float(p0[0]),
+        ay=float(p0[1]),
+        xref="x",
+        yref="y",
+        axref="x",
+        ayref="y",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=head,
+        arrowwidth=width,
+        arrowcolor=color,
+        standoff=standoff,
+        text="",
+    )
+
+
+def _vector_label(fig: go.Figure, pos, text: str, color: str, away=(0.0, 0.0), size: int = 12) -> None:
+    fig.add_annotation(
+        x=float(pos[0]),
+        y=float(pos[1]),
+        xref="x",
+        yref="y",
+        text=text,
+        showarrow=False,
+        font=dict(size=size, color=color),
+        **_anchors(float(away[0]), float(away[1])),
+    )
+
+
+def _legend_line(fig: go.Figure, name: str, color: str, width: float = 3.0, dash: str = "solid") -> None:
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None], mode="lines", line=dict(color=color, width=width, dash=dash), name=name, hoverinfo="skip"
+        )
+    )
+
+
+def fig_event_snapshot(
+    kin: Kinematics,
+    res: SimulationResult,
+    snap: EventSnapshot,
+    title: str = "",
+    context: str = "",
+    travel: dict | None = None,
+    magnification: float | None = None,
+) -> go.Figure:
+    """One frozen frame of an event: push on the carrier, inertial load vs. friction limit, cluster movement.
+
+    Carrier view (GOT fixed). The cluster is drawn at its nominal position before the event and, magnified, where
+    the event moves it; the numbers on the corners are the true shifts in mm.
+    """
+    cl = res.cluster
+    L, W = cl.length, cl.width
+    Lg, Wg = snap.outline
+    M = max(L, W)
+    com0 = np.asarray(res.patch.com, dtype=float)
+    moved = bool(snap.slipped and snap.corner_shift_mm.max() >= 0.005)
+    k = float(magnification) if magnification else event_magnification(res, snap)
+    R = 0.5 * np.hypot(Lg, Wg) + 0.42 * M
+    hit_col = CRITICAL if snap.is_hit else MUTED
+    move_col = C1
+    fig = go.Figure()
+
+    # ---- GOT, cluster before (nominal) and after the event (magnified)
+    gx, gy = _rect(0, 0, Lg, Wg, 0.0)
+    nx_, ny_ = _rect(0, 0, L, W, 0.0)
+    fig.add_trace(
+        go.Scatter(
+            x=gx,
+            y=gy,
+            mode="lines",
+            line=dict(color=MUTED, width=2),
+            fill="toself",
+            fillcolor="rgba(137,135,129,0.08)",
+            name="GOT (schematic)",
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=nx_,
+            y=ny_,
+            mode="lines",
+            line=dict(color=MUTED, width=1.2, dash="dot"),
+            name="Cluster before the event",
+            hoverinfo="skip",
+            showlegend=moved,
+        )
+    )
+    ph = k * snap.dphi if moved else 0.0
+    com = com0 + (k * snap.du if moved else 0.0)
+    cb = cl.corners() - com0
+    c, s = np.cos(ph), np.sin(ph)
+    cx = com[0] + c * cb[:, 0] - s * cb[:, 1]
+    cy = com[1] + s * cb[:, 0] + c * cb[:, 1]
+    fig.add_trace(
+        go.Scatter(
+            x=np.r_[cx, cx[0]],
+            y=np.r_[cy, cy[0]],
+            mode="lines",
+            line=dict(color=CRITICAL if moved else C1, width=2),
+            fill="toself",
+            fillcolor="rgba(208,59,59,0.22)" if moved else "rgba(42,120,214,0.22)",
+            name=("Cluster after the event" + (f" (movement ×{k:g})" if k != 1 else "")) if moved else "Cluster (no slip)",
+            hoverinfo="skip",
+        )
+    )
+
+    # ---- inertial load on the cluster against the friction limit (same scale in g)
+    load = np.asarray(snap.load_g, dtype=float)
+    lmag = float(np.hypot(*load))
+    s_g = 0.42 * W / max(lmag, snap.limit_g, 1e-6)  # metres per g
+    lu = load / lmag if lmag > 1e-9 else np.array([0.0, 1.0])
+    r_lim = s_g * snap.limit_g
+    fig.add_shape(
+        type="circle",
+        xref="x",
+        yref="y",
+        x0=com0[0] - r_lim,
+        y0=com0[1] - r_lim,
+        x1=com0[0] + r_lim,
+        y1=com0[1] + r_lim,
+        line=dict(color=CRITICAL, width=1.5, dash="dot"),
+    )
+    # labels beside the arrow, one on each side, so they stay clear of what lies ahead of it (the hit point)
+    lp = np.array([-lu[1], lu[0]])
+    if lp[1] < -1e-9 or (abs(lp[1]) <= 1e-9 and lp[0] < 0):
+        lp = -lp
+    _vector_label(fig, com0 - lp * (r_lim + 0.02 * M), f"Friction limit {snap.limit_g:.2f} g", CRITICAL, away=-lp, size=11)
+    if s_g * lmag > 0.01 * M:
+        _vector(fig, com0, com0 + s_g * load, C2, width=4.5, head=0.9)
+    _vector_label(fig, com0 + lu * max(0.6 * s_g * lmag, r_lim) + lp * 0.03 * M, f"Inertial load {lmag:.2f} g", C2, away=lp)
+
+    # ---- push on the carrier: line of action, hit point and force arrow
+    d = np.asarray(snap.force_dir, dtype=float)
+    if snap.kind != KIND_WEAK:
+        q0 = np.asarray(snap.line_point, dtype=float)
+        fig.add_trace(
+            go.Scatter(
+                x=[q0[0] - 4 * R * d[0], q0[0] + 4 * R * d[0]],
+                y=[q0[1] - 4 * R * d[1], q0[1] + 4 * R * d[1]],
+                mode="lines",
+                line=dict(color=hit_col, width=1.3, dash="dash"),
+                name="Line of action of the push" if snap.is_hit else "Line of action of the net force",
+                hoverinfo="skip",
+            )
+        )
+        ln = float(np.clip(s_g * snap.acc_peak_g, 0.16 * M, 0.32 * M))
+        word = "HIT" if snap.is_hit else "Net force"
+        hit_text = f"<b>{word}</b> {snap.acc_peak_g:.2f} g"
+        hn = np.array([-d[1], d[0]])  # label beside the arrow, on the side of the centre line (corner labels are outside)
+        if float(np.dot(hn, q0)) > 1e-9 or (abs(float(np.dot(hn, q0))) <= 1e-9 and (hn[1] < 0 or (hn[1] == 0 and hn[0] < 0))):
+            hn = -hn
+        if not snap.hit_outside:
+            q = np.asarray(snap.hit_xy, dtype=float)
+            _vector(fig, q - ln * d, q, hit_col, width=6, head=0.8, standoff=10 if snap.is_hit else 0)
+            _vector_label(fig, q - 0.6 * ln * d + 0.035 * M * hn, hit_text, hit_col, away=hn, size=13)
+            if snap.is_hit:  # a ramp is driven from below along that line: no hit point to mark
+                fig.add_trace(
+                    go.Scatter(
+                        x=[q[0]],
+                        y=[q[1]],
+                        mode="markers",
+                        marker=dict(symbol="star", size=20, color=hit_col, line=dict(width=1, color="white")),
+                        name="Estimated hit point",
+                        hoverinfo="skip",
+                    )
+                )
+        else:
+            q = np.asarray(snap.hit_xy, dtype=float)
+            if np.hypot(*q0) < 0.9 * R:
+                _vector(fig, q0 - ln * d, q0, hit_col, width=6, head=0.8)
+                _vector_label(fig, q0 - 0.6 * ln * d + 0.035 * M * hn, hit_text, hit_col, away=hn, size=13)
+            if snap.is_hit:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[q[0]],
+                        y=[q[1]],
+                        mode="markers",
+                        marker=dict(symbol="star-open", size=20, color=hit_col, line=dict(width=2, color=hit_col)),
+                        name="Nearest corner (carrier mostly twisted)",
+                        hoverinfo="skip",
+                    )
+                )
+
+    # ---- predicted cluster movement: corners, centre of mass, rotation, pivot
+    shifts = snap.corner_shift_mm
+    corner_text = [f"{CORNER_SHORT[i]} {shifts[i]:.2f} mm" if moved else CORNER_SHORT[i] for i in range(4)]
+    # labels outside the cluster, across the direction in which the corner moves (its arrow runs along it)
+    corner_pos = ["top right", "bottom right", "bottom left", "top left"]
+    if moved:
+        for i in range(4):
+            if abs(snap.dcorner[i, 0]) >= abs(snap.dcorner[i, 1]):
+                corner_pos[i] = "top center" if i in (0, 3) else "bottom center"
+            else:
+                corner_pos[i] = "middle right" if i in (0, 1) else "middle left"
+    fig.add_trace(
+        go.Scatter(
+            x=cx,
+            y=cy,
+            mode="markers+text",
+            marker=dict(color=INK_2, size=7),
+            text=corner_text,
+            textposition=corner_pos,
+            textfont=dict(size=12, color=move_col if moved else INK_2),
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    if moved:
+        nom = cl.corners()
+        for i in range(4):
+            if np.hypot(cx[i] - nom[i, 0], cy[i] - nom[i, 1]) > 0.004 * M:
+                _vector(fig, nom[i], (cx[i], cy[i]), move_col, width=2.5, head=1.0)
+        if np.hypot(*(com - com0)) > 0.004 * M:
+            _vector(fig, com0, com, move_col, width=3.5, head=0.9)
+        rot = float(np.rad2deg(snap.dphi))
+        if abs(rot) >= 0.0005:
+            sgn = 1.0 if rot > 0 else -1.0
+            r_arc = 0.30 * W
+            th_mid = float(np.arctan2(-lu[1], -lu[0]))  # behind the inertial-load arrow
+            th = th_mid + sgn * np.deg2rad(np.linspace(-45.0, 45.0, 40))
+            ax_, ay_ = com[0] + r_arc * np.cos(th), com[1] + r_arc * np.sin(th)
+            fig.add_trace(
+                go.Scatter(
+                    x=ax_, y=ay_, mode="lines", line=dict(color=move_col, width=2.5), showlegend=False, hoverinfo="skip"
+                )
+            )
+            _vector(fig, (ax_[-6], ay_[-6]), (ax_[-1], ay_[-1]), move_col, width=2.5, head=1.0)
+            mid = th[len(th) // 2]
+            _vector_label(
+                fig,
+                (com[0] + (r_arc + 0.03 * M) * np.cos(mid), com[1] + (r_arc + 0.03 * M) * np.sin(mid)),
+                f"{rot:+.3f}°",
+                move_col,
+                away=(np.cos(mid), np.sin(mid)),
+            )
+    fig.add_trace(
+        go.Scatter(
+            x=[com0[0]],
+            y=[com0[1]],
+            mode="markers",
+            marker=dict(color=INK_2, size=7, symbol="circle"),
+            name="Cluster centre of mass",
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    if snap.pivot is not None and moved and np.hypot(*snap.pivot) < R:
+        fig.add_trace(
+            go.Scatter(
+                x=[snap.pivot[0]],
+                y=[snap.pivot[1]],
+                mode="markers+text",
+                marker=dict(symbol="x", size=13, color=move_col, line=dict(width=1)),
+                text=["Pivot"],
+                textposition="bottom center",
+                textfont=dict(size=11, color=move_col),
+                name="Pivot of the cluster",
+                hoverinfo="skip",
+            )
+        )
+
+    # ---- travel direction of the carrier, beside the GOT
+    trav_col = None
+    if travel is not None and int(travel["state"][snap.i_peak]) == STATE_MOVING:
+        tx, ty = float(travel["ux"][snap.i_peak]), float(travel["uy"][snap.i_peak])
+        if np.isfinite(tx) and np.isfinite(ty):
+            trav_col = MUTED if travel["confidence"][snap.i_peak] == "Low" else SERIES[6]
+            tdir = np.array([tx, ty])
+            side = np.array([ty, -tx])  # right-hand side of the travel direction
+            if float(np.dot(side, d)) < -0.5 and snap.kind != KIND_WEAK:
+                side = -side  # keep clear of a push that comes from that side
+            c0 = side * (Lg / 2 * abs(side[0]) + Wg / 2 * abs(side[1]) + 0.10 * M)
+            _vector(fig, c0 - 0.14 * M * tdir, c0 + 0.14 * M * tdir, trav_col, width=4, head=0.9)
+            lab = str(travel["label"][snap.i_peak]) + (" ?" if trav_col == MUTED else "")
+            _vector_label(fig, c0 + 0.03 * M * side, f"Travel {lab}", trav_col, away=side, size=11)
+
+    # ---- legend entries of the arrows (annotations do not appear in the legend)
+    if snap.kind != KIND_WEAK:
+        _legend_line(fig, "Push on the carrier" if snap.is_hit else "Net force on the carrier", hit_col, 5)
+    _legend_line(fig, "Inertial load on the cluster", C2, 4)
+    _legend_line(fig, "Friction limit (same scale)", CRITICAL, 1.5, "dot")
+    if moved:
+        _legend_line(fig, "Cluster movement (labels: true mm)", move_col, 3)
+    if trav_col is not None:
+        _legend_line(fig, "Travel direction", trav_col, 4)
+
+    # ---- text panel
+    clock = pd.Timestamp(snap.clock_peak).strftime("%H:%M:%S.%f")[:-3]
+    lines = ([f"<b>{title}</b>"] if title else []) + [f"{clock}  ·  t = {snap.t_peak:.2f} s", ""]
+    lines += summary_lines(snap, context)
+    if snap.notes:
+        import textwrap
+
+        lines.append("")
+        for note in snap.notes:
+            lines += [f"<i>{row}</i>" for row in textwrap.wrap(note, 46)]
+    fig.add_annotation(
+        x=0.66,
+        y=1.0,
+        xref="paper",
+        yref="paper",
+        xanchor="left",
+        yanchor="top",
+        align="left",
+        showarrow=False,
+        text="<br>".join(lines),
+        font=dict(size=12),
+    )
+    fig.update_layout(
+        title=dict(
+            text="Event snapshot — carrier view (GOT fixed)"
+            + (f", cluster movement magnified ×{k:g}" if moved and k != 1 else ""),
+            x=0,
+            font=dict(size=14),
+        ),
+        height=780,
+        margin=dict(l=10, r=10, t=60, b=120),
+        xaxis=dict(
+            range=[-R, R], domain=[0.0, 0.64], title_text="X [m]  (Front →)", zeroline=False, constrain="domain"
+        ),
+        yaxis=dict(
+            range=[-R, R],
+            title_text="Y [m]  (Left ↑)",
+            zeroline=False,
+            scaleanchor="x",
+            scaleratio=1,
+            constrain="domain",
+        ),
+        legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="left", x=0.0),
+        hovermode=False,
     )
     return fig
 
